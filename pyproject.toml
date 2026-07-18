@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drift-be-gone"
+version = "0.1.0"
+description = "Manifest-driven architecture gate and repo-understanding map."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[project.scripts]
+drift = "drift.cli:main"
+
+[tool.setuptools]
+packages = ["drift"]
+
+[tool.setuptools.package-data]
+drift = ["data/*.json"]

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Enforce the architecture gate before committing.
+set -euo pipefail
+PYTHONPATH="$(git rev-parse --show-toplevel)" python3 -m drift.cli check . --strict

@@ -1,0 +1,19 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run tests
+        run: PYTHONPATH="$PWD" python3 -m unittest discover -s tests -t .
+      - name: Self-check architecture
+        run: PYTHONPATH="$PWD" python3 -m drift.cli check . --strict

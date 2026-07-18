@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "no-cycles",
+      "type": "no-cycles",
+      "enabled": true,
+      "severity": "error",
+      "description": "Modules must not form circular dependencies.",
+      "what": "Detects import cycles across the module dependency graph.",
+      "why": "Cycles couple modules, block refactoring, and hide design flaws.",
+      "source_refs": [
+        "drift-be-gone/no-cycles"
+      ]
+    },
+    {
+      "id": "orphan-modules",
+      "type": "orphan-modules",
+      "enabled": true,
+      "severity": "warning",
+      "allow": [
+        "**/__init__.py",
+        "**/main.py",
+        "**/cli.py",
+        "**/test_*.py",
+        "**/*_test.py",
+        "tests/**",
+        "**/*.test.*"
+      ],
+      "description": "Every module should be reachable from the graph.",
+      "what": "Flags modules that nothing imports (excluding entrypoints).",
+      "why": "Orphan modules are usually dead code or a missing wiring.",
+      "source_refs": [
+        "drift-be-gone/orphan-modules"
+      ]
+    },
+    {
+      "id": "layering",
+      "type": "layering",
+      "enabled": false,
+      "severity": "error",
+      "layers": [],
+      "description": "Higher layers may import lower layers, never the reverse.",
+      "what": "Enforces a declared layer order over path globs.",
+      "why": "Layering keeps dependencies flowing one direction so the core stays clean.",
+      "source_refs": [
+        "drift-be-gone/layering"
+      ]
+    },
+    {
+      "id": "forbidden-deps",
+      "type": "forbidden-deps",
+      "enabled": false,
+      "severity": "error",
+      "pairs": [],
+      "description": "Declared module pairs must never depend on each other.",
+      "what": "Flags any import that matches a forbidden from/to path pair.",
+      "why": "Explicit forbidden edges protect boundaries from accidental coupling.",
+      "source_refs": [
+        "drift-be-gone/forbidden-deps"
+      ]
+    },
+    {
+      "id": "entrypoints-exist",
+      "type": "entrypoints-exist",
+      "enabled": false,
+      "severity": "error",
+      "entrypoints": [],
+      "description": "Declared entrypoints must exist on disk.",
+      "what": "Verifies each declared entrypoint path is present.",
+      "why": "A missing entrypoint means the declared architecture is already wrong.",
+      "source_refs": [
+        "drift-be-gone/entrypoints-exist"
+      ]
+    }
+  ]
+}
