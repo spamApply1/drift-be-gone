@@ -336,6 +336,101 @@ class ArchitectureRuleTests(unittest.TestCase):
             {"rules": [{"id": "x", "type": "canonical-abstractions", "canonical": 123}]}
         ))
 
+    def test_canonical_abstraction_namespace_imports(self) -> None:
+        self._write("shared/rtc/webrtc.ts", "export const rtc = 1;\n")
+        self._write(
+            "features/chat.ts",
+            "import * as RTC from 'simple-peer';\n"
+            "export * as RTC2 from 'simple-peer';\n",
+        )
+        manifest = {
+            "rules": [
+                {
+                    "id": "canonical-webrtc",
+                    "type": "canonical-abstractions",
+                    "canonical": "shared/rtc/**",
+                    "restricted_imports": ["simple-peer"],
+                }
+            ]
+        }
+        violations = RuleEngine(manifest).scan(self.root, strict=True)
+        self.assertEqual(len(violations), 2)
+        lines = [v.line for v in violations]
+        self.assertEqual(lines, [1, 2])
+
+    def test_canonical_abstraction_ignores_restricted_text_in_strings(self) -> None:
+        self._write("shared/rtc/webrtc.ts", "export const rtc = 1;\n")
+        self._write(
+            "features/chat.ts",
+            "const a = \"import('simple-peer')\";\n"
+            "const b = \"RTCPeerConnection in description\";\n"
+            "console.log(\"mediaDevices.getUserMedia\");\n",
+        )
+        manifest = {
+            "rules": [
+                {
+                    "id": "canonical-webrtc",
+                    "type": "canonical-abstractions",
+                    "canonical": "shared/rtc/**",
+                    "restricted_imports": ["simple-peer"],
+                    "restricted_primitives": ["RTCPeerConnection", "mediaDevices.getUserMedia"],
+                }
+            ]
+        }
+        violations = RuleEngine(manifest).scan(self.root, strict=True)
+        self.assertEqual(violations, [])
+
+    def test_canonical_abstraction_optional_chaining(self) -> None:
+        self._write("shared/rtc/webrtc.ts", "export const rtc = 1;\n")
+        self._write(
+            "features/chat.ts",
+            "const a = navigator?.mediaDevices?.getUserMedia();\n",
+        )
+        manifest = {
+            "rules": [
+                {
+                    "id": "canonical-webrtc",
+                    "type": "canonical-abstractions",
+                    "canonical": "shared/rtc/**",
+                    "restricted_primitives": ["navigator.mediaDevices.getUserMedia"],
+                }
+            ]
+        }
+        violations = RuleEngine(manifest).scan(self.root, strict=True)
+        self.assertEqual(len(violations), 1)
+        self.assertEqual(violations[0].line, 1)
+
+    def test_no_duplicate_symbols_same_domain_flagged_by_default(self) -> None:
+        self._write("src/features/chat.py", "class ConnectionManager:\n    pass\n")
+        self._write("src/features/video.py", "class ConnectionManager:\n    pass\n")
+        manifest = {
+            "rules": [
+                {
+                    "id": "no-duplicate-symbols",
+                    "type": "no-duplicate-symbols",
+                    "severity": "error",
+                }
+            ]
+        }
+        violations = RuleEngine(manifest).scan(self.root, strict=True)
+        self.assertEqual(len(violations), 2)
+        paths = {v.path for v in violations}
+        self.assertEqual(paths, {"src/features/chat.py", "src/features/video.py"})
+
+    def test_invalid_manifest_blocks_check_without_crash(self) -> None:
+        self._write("features/chat.py", "x = 1\n")
+        manifest = {
+            "rules": [
+                {
+                    "id": "bad-rule",
+                    "type": "canonical-abstractions",
+                    "abstractions": [None],
+                }
+            ]
+        }
+        violations = RuleEngine(manifest).scan(self.root, strict=True)
+        self.assertTrue(any(v.rule_id == "manifest-invalid" for v in violations))
+
     def test_cli_manifest_auto_discovery(self) -> None:
         root = Path(tempfile.mkdtemp())
         (root / "shared" / "rtc").mkdir(parents=True)
@@ -406,6 +501,28 @@ class MapTests(unittest.TestCase):
         self.assertIn("canonical_abstractions", artifact)
         self.assertEqual(len(artifact["canonical_abstractions"]), 1)
         self.assertEqual(artifact["canonical_abstractions"][0]["name"], "canonical-webrtc")
+        self.assertEqual(artifact["canonical_abstractions"][0]["canonical"], "shared/rtc/**")
+
+    def test_map_inherits_parent_canonical_path(self) -> None:
+        self._write("pkg/a.py", "x = 1\n")
+        manifest = {
+            "rules": [
+                {
+                    "id": "canonical-suite",
+                    "type": "canonical-abstractions",
+                    "canonical": "shared/rtc/**",
+                    "abstractions": [
+                        {
+                            "restricted_imports": ["aiortc"],
+                        }
+                    ],
+                }
+            ]
+        }
+        artifact = build_map(self.root, manifest=manifest)
+        self.assertIn("canonical_abstractions", artifact)
+        self.assertEqual(len(artifact["canonical_abstractions"]), 1)
+        self.assertEqual(artifact["canonical_abstractions"][0]["name"], "canonical-suite")
         self.assertEqual(artifact["canonical_abstractions"][0]["canonical"], "shared/rtc/**")
 
 

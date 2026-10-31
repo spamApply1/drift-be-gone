@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .analyze import Graph, build_graph
+from .engine import _normalize_abstractions
 
 
 def _notable_files(graph: Graph, limit: int = 15) -> list[str]:
@@ -49,21 +50,19 @@ def _extract_abstractions(manifest: dict | None) -> list[dict]:
         return []
     items: list[dict] = []
     for r in manifest.get("rules", []):
+        if not isinstance(r, dict):
+            continue
         if r.get("type") != "canonical-abstractions" or not r.get("enabled", True):
             continue
-        abstractions = r.get("abstractions")
-        if isinstance(abstractions, list):
-            items.extend(abstractions)
-        elif "canonical" in r:
-            items.append(r)
+        items.extend(_normalize_abstractions(r))
     return [
         {
-            "name": a.get("name") or a.get("id", "unnamed"),
+            "name": a.get("name") or a.get("id") or "unnamed",
             "canonical": a.get("canonical"),
             "description": a.get("description", ""),
-            "restricted_imports": a.get("restricted_imports", []),
-            "restricted_primitives": a.get("restricted_primitives", []),
-            "restricted_symbols": a.get("restricted_symbols", []),
+            "restricted_imports": a.get("restricted_imports") or [],
+            "restricted_primitives": a.get("restricted_primitives") or [],
+            "restricted_symbols": a.get("restricted_symbols") or [],
         }
         for a in items
     ]

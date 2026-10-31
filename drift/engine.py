@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
 
-from .analyze import Graph, Module, _strip_js_comments, build_graph
+from .analyze import Graph, Module, _clean_js_for_primitives, build_graph
 
 RULE_TYPES = frozenset(
     {
@@ -50,8 +50,12 @@ def _normalize_patterns(val: str | list[str] | None) -> list[str]:
 
 
 def _domain_of(path: str) -> str:
-    parts = path.split("/")
-    return parts[0] if len(parts) > 1 else ""
+    parts = Path(path).parent.parts
+    if not parts:
+        return path
+    if parts[0] in ("src", "lib", "app", "packages") and len(parts) > 1:
+        return "/".join(parts[:2])
+    return parts[0]
 
 
 def _find_line_number(path: Path, pattern: str, is_regex: bool = False) -> int | None:
@@ -71,10 +75,13 @@ def _find_line_number(path: Path, pattern: str, is_regex: bool = False) -> int |
 def _primitive_regex(primitive: str) -> re.Pattern:
     if "." in primitive:
         parts = primitive.split(".")
-        sub = [rf"(?:\.\s*{re.escape(p)}|\[\s*['\"]{re.escape(p)}['\"]\s*\])" for p in parts[1:]]
+        sub = [
+            rf"(?:\.\s*|\?\.\s*|\[\s*['\"]){re.escape(p)}(?:['\"]\s*\])?"
+            for p in parts[1:]
+        ]
         pattern = rf"\b{re.escape(parts[0])}" + "".join(sub) + r"(?!\w)"
     else:
-        pattern = rf"\b{re.escape(primitive)}\b"
+        pattern = rf"(?:\b{re.escape(primitive)}\b|\[\s*['\"]{re.escape(primitive)}['\"]\s*\])"
     return re.compile(pattern)
 
 
@@ -108,7 +115,7 @@ def _find_py_primitive_lines(code: str, primitive: str) -> list[int]:
 
 
 def _find_js_primitive_lines(code: str, primitive: str) -> list[int]:
-    cleaned = _strip_js_comments(code)
+    cleaned = _clean_js_for_primitives(code)
     pattern = _primitive_regex(primitive)
     lines: list[int] = []
     for match in pattern.finditer(cleaned):
@@ -224,7 +231,7 @@ def _check_restricted_imports(
     item: dict,
     canonical_display: str,
 ) -> list[Violation]:
-    restricted_imports = item.get("restricted_imports", [])
+    restricted_imports = item.get("restricted_imports") or []
     custom_message = item.get("message")
     out: list[Violation] = []
     seen: set[tuple[int, str]] = set()
@@ -261,7 +268,7 @@ def _check_restricted_primitives(
     item: dict,
     canonical_display: str,
 ) -> list[Violation]:
-    restricted_primitives = item.get("restricted_primitives", [])
+    restricted_primitives = item.get("restricted_primitives") or []
     custom_message = item.get("message")
     if not restricted_primitives or not file_path.exists():
         return []
@@ -304,7 +311,7 @@ def _check_restricted_symbols(
     item: dict,
     canonical_display: str,
 ) -> list[Violation]:
-    restricted_symbols = item.get("restricted_symbols", [])
+    restricted_symbols = item.get("restricted_symbols") or []
     custom_message = item.get("message")
     if not restricted_symbols:
         return []
@@ -315,9 +322,9 @@ def _check_restricted_symbols(
             continue
         line = _find_line_number(
             file_path,
-            rf"\b(def|class|function|const|let|var)\s+{re.escape(sym)}\b",
+            rf"^\s*(?:export\s+)?(?:async\s+)?(def|class|function|const|let|var)\s+{re.escape(sym)}\b",
             is_regex=True,
-        )
+        ) or _find_line_number(file_path, sym)
         msg = custom_message or (
             f"symbol '{sym}' must only be defined in canonical path '{canonical_display}'."
         )
@@ -377,24 +384,30 @@ def _normalize_abstractions(rule: dict) -> list[dict]:
     rule_canonical = rule.get("canonical")
     rule_allow = rule.get("allow")
     rule_message = rule.get("message")
+    rule_id = rule.get("id", "canonical-abstractions")
 
     raw = rule.get("abstractions")
     if isinstance(raw, list):
         items: list[dict] = []
-        for item in raw:
+        for idx, item in enumerate(raw):
             if not isinstance(item, dict):
                 continue
             merged = dict(item)
-            if "allow" not in merged and rule_allow is not None:
-                merged["allow"] = rule_allow
-            if "message" not in merged and rule_message is not None:
-                merged["message"] = rule_message
-            if "canonical" not in merged and rule_canonical is not None:
+            if merged.get("canonical") is None and rule_canonical is not None:
                 merged["canonical"] = rule_canonical
+            if merged.get("allow") is None and rule_allow is not None:
+                merged["allow"] = rule_allow
+            if merged.get("message") is None and rule_message is not None:
+                merged["message"] = rule_message
+            if not merged.get("name") and not merged.get("id"):
+                merged["name"] = rule_id
             items.append(merged)
         return items
     if "canonical" in rule:
-        return [rule]
+        single = dict(rule)
+        if not single.get("name") and not single.get("id"):
+            single["name"] = rule_id
+        return [single]
     return []
 
 
@@ -418,7 +431,7 @@ def _no_duplicate_symbols(rule: dict, graph: Graph, root: Path) -> list[Violatio
     ]
     ignore_symbols = set(rule.get("ignore", default_ignore))
     min_length = rule.get("min_length", 4)
-    allow_same_domain = rule.get("allow_same_domain", True)
+    allow_same_domain = rule.get("allow_same_domain", False)
 
     symbols: dict[str, list[str]] = {}
     for rel, module in graph.modules.items():
@@ -438,7 +451,7 @@ def _no_duplicate_symbols(rule: dict, graph: Graph, root: Path) -> list[Violatio
         for path in sorted(paths):
             line = _find_line_number(
                 root / path,
-                rf"^(?:export\s+)?(?:async\s+)?(def|class|function|const|let|var)\s+{re.escape(sym)}\b",
+                rf"^\s*(?:export\s+)?(?:async\s+)?(def|class|function|const|let|var)\s+{re.escape(sym)}\b",
                 is_regex=True,
             ) or _find_line_number(root / path, sym)
             msg = (
@@ -462,9 +475,22 @@ _RULES = {
 
 class RuleEngine:
     def __init__(self, manifest: dict):
-        self.rules = [r for r in manifest.get("rules", []) if r.get("enabled", True)]
+        self.manifest = manifest
+        self.rules = [r for r in manifest.get("rules", []) if isinstance(r, dict) and r.get("enabled", True)]
 
     def scan(self, root: Path, strict: bool = False, graph: Graph | None = None) -> list[Violation]:
+        problems = validate_manifest(self.manifest)
+        if problems:
+            return [
+                Violation(
+                    rule_id="manifest-invalid",
+                    path="manifest",
+                    line=None,
+                    message=f"invalid manifest: {p}",
+                    severity="error",
+                )
+                for p in problems
+            ]
         graph = graph or build_graph(root)
         violations: list[Violation] = []
         for rule in self.rules:
@@ -483,6 +509,7 @@ class RuleEngine:
 
 def _validate_str_or_str_list(val: object, field_name: str, label: str, problems: list[str]) -> None:
     if val is None:
+        problems.append(f"{label}: '{field_name}' must not be null")
         return
     if isinstance(val, str):
         if not val.strip():
@@ -497,6 +524,7 @@ def _validate_str_or_str_list(val: object, field_name: str, label: str, problems
 
 def _validate_str_list(val: object, field_name: str, label: str, problems: list[str]) -> None:
     if val is None:
+        problems.append(f"{label}: '{field_name}' must not be null")
         return
     if not isinstance(val, list):
         problems.append(f"{label}: '{field_name}' must be a list of strings")
@@ -506,17 +534,24 @@ def _validate_str_list(val: object, field_name: str, label: str, problems: list[
             problems.append(f"{label}: '{field_name}[{idx}]' must be a non-empty string")
 
 
-def _validate_abstraction_item(abs_item: object, a_label: str, parent_has_canonical: bool, problems: list[str]) -> None:
+def _validate_abstraction_item(
+    abs_item: object, a_label: str, parent_has_canonical: bool, problems: list[str]
+) -> None:
     if not isinstance(abs_item, dict):
         problems.append(f"{a_label}: abstraction must be an object")
         return
     if "canonical" not in abs_item and not parent_has_canonical:
         problems.append(f"{a_label}: must define 'canonical'")
-    _validate_str_or_str_list(abs_item.get("canonical"), "canonical", a_label, problems)
-    _validate_str_or_str_list(abs_item.get("allow"), "allow", a_label, problems)
-    _validate_str_list(abs_item.get("restricted_imports"), "restricted_imports", a_label, problems)
-    _validate_str_list(abs_item.get("restricted_primitives"), "restricted_primitives", a_label, problems)
-    _validate_str_list(abs_item.get("restricted_symbols"), "restricted_symbols", a_label, problems)
+    if "canonical" in abs_item:
+        _validate_str_or_str_list(abs_item.get("canonical"), "canonical", a_label, problems)
+    if "allow" in abs_item:
+        _validate_str_or_str_list(abs_item.get("allow"), "allow", a_label, problems)
+    if "restricted_imports" in abs_item:
+        _validate_str_list(abs_item.get("restricted_imports"), "restricted_imports", a_label, problems)
+    if "restricted_primitives" in abs_item:
+        _validate_str_list(abs_item.get("restricted_primitives"), "restricted_primitives", a_label, problems)
+    if "restricted_symbols" in abs_item:
+        _validate_str_list(abs_item.get("restricted_symbols"), "restricted_symbols", a_label, problems)
 
 
 def _validate_canonical_rule(rule: dict, label: str, problems: list[str]) -> None:

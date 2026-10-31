@@ -17,20 +17,26 @@ _SKIP_DIRS = frozenset(
 )
 _PY = (".py",)
 _JS = (".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx")
-_JS_IMPORT_PATTERN = re.compile(
-    r"""(?:(?:import|export)\s+(?:(?:\*|[A-Za-z0-9_$,\s{}]+)\s+from\s+)?['"]([^'"]+)['"]|"""
-    r"""(?:require|import)\s*\(\s*['"]([^'"]+)['"]\))"""
-)
-_JS_FN_TOP = re.compile(
-    r"^(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)",
+
+_JS_TOKEN_SPEC = [
+    ("COMMENT", r"/\*[\s\S]*?\*/|//[^\r\n]*"),
+    ("STRING", r'"(?:\\.|[^"\\])*"|\x27(?:\\.|[^\x27\\])*\x27|`(?:\\.|[^`\\])*`'),
+    ("STATIC_IMPORT", r"""(?:import|export)\s+(?:(?:(?!\bfrom\b)[^;])*?\bfrom\s+)?[\x27"]([^\x27"]+)[\x27"]"""),
+    ("CALL_IMPORT", r"""\b(?:require|import)\s*\(\s*[\x27"]([^\x27"]+)[\x27"]\s*\)"""),
+]
+_JS_TOKEN_REGEX = re.compile("|".join(f"(?P<{pair[0]}>{pair[1]})" for pair in _JS_TOKEN_SPEC))
+
+_JS_FN = re.compile(
+    r"^\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)",
     re.MULTILINE,
 )
-_JS_ARROW_TOP = re.compile(
-    r"^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>",
+_JS_CLASS = re.compile(
+    r"^\s*(?:export\s+(?:default\s+)?)?class\s+([A-Za-z_$][\w$]*)",
     re.MULTILINE,
 )
-_JS_CLASS_TOP = re.compile(
-    r"^(?:export\s+(?:default\s+)?)?class\s+([A-Za-z_$][\w$]*)",
+_JS_ARROW = re.compile(
+    r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::\s*[^=]+)?\s*=\s*"
+    r"(?:async\s*)?(?:<[^>]*>)?\s*(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*(?::\s*[^=]+)?\s*=>",
     re.MULTILINE,
 )
 
@@ -45,6 +51,46 @@ def _strip_js_comments(src: str) -> str:
         return m.group(1)
 
     return re.sub(pattern, replacer, src)
+
+
+def _clean_js_for_primitives(src: str) -> str:
+    pattern = (
+        r'(/\*[\s\S]*?\*/|//[^\r\n]*)'
+        r'|(\[\s*(?:"(?:\\.|[^"\\])*"|\x27(?:\\.|[^\x27\\])*\x27)\s*\])'
+        r'|("(?:\\.|[^"\\])*"|\x27(?:\\.|[^\x27\\])*\x27|`(?:\\.|[^`\\])*`)'
+    )
+
+    def replacer(m: re.Match) -> str:
+        if m.group(1):
+            s = m.group(1)
+            return "\n" * s.count("\n") + " " * (len(s) - s.count("\n"))
+        if m.group(2):
+            return m.group(2)
+        if m.group(3):
+            s = m.group(3)
+            return "\n" * s.count("\n") + " " * (len(s) - s.count("\n"))
+        return m.group(0)
+
+    return re.sub(pattern, replacer, src)
+
+
+def _extract_js_imports(src: str) -> list[tuple[str, int]]:
+    results: list[tuple[str, int]] = []
+    for match in _JS_TOKEN_REGEX.finditer(src):
+        kind = match.lastgroup
+        if kind == "STATIC_IMPORT":
+            spec = match.group("STATIC_IMPORT")
+            target = re.search(r"""[\x27"]([^\x27"]+)[\x27"]\s*$""", spec)
+            if target:
+                line = src[:match.start()].count("\n") + 1
+                results.append((target.group(1), line))
+        elif kind == "CALL_IMPORT":
+            spec = match.group("CALL_IMPORT")
+            target = re.search(r"""[\x27"]([^\x27"]+)[\x27"]""", spec)
+            if target:
+                line = src[:match.start()].count("\n") + 1
+                results.append((target.group(1), line))
+    return results
 
 
 @dataclass
@@ -153,15 +199,13 @@ def _top_level(node: ast.AST, tree: ast.AST) -> bool:
 def _analyze_js(path: Path, rel: str) -> Module:
     module = Module(path=rel)
     text = path.read_text(encoding="utf-8", errors="ignore")
-    cleaned = _strip_js_comments(text)
-    for m in _JS_IMPORT_PATTERN.finditer(cleaned):
-        spec = m.group(1) or m.group(2)
-        line = cleaned[:m.start()].count("\n") + 1
+    for spec, line in _extract_js_imports(text):
         module.imports.add(spec)
         module.import_locations.append((spec, line))
-    module.functions.extend(_JS_FN_TOP.findall(cleaned))
-    module.functions.extend(_JS_ARROW_TOP.findall(cleaned))
-    module.classes.extend(_JS_CLASS_TOP.findall(cleaned))
+    cleaned = _clean_js_for_primitives(text)
+    module.functions.extend(_JS_FN.findall(cleaned))
+    module.functions.extend(_JS_ARROW.findall(cleaned))
+    module.classes.extend(_JS_CLASS.findall(cleaned))
     return module
 
 
