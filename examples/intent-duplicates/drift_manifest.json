@@ -1,0 +1,13 @@
+{
+  "rules": [
+    {
+      "id": "implementation-shape-review",
+      "type": "no-duplicate-implementations",
+      "enabled": true,
+      "severity": "warning",
+      "min_similarity": 0.86,
+      "min_features": 8,
+      "allow": ["**/*test*", "**/*.test.*"]
+    }
+  ]
+}

@@ -8,24 +8,39 @@ dependency graph quietly turns into spaghetti. It is pure Python, local-first,
 and has no build step — point it at a repo and it tells you both *what exists*
 and *what just broke the rules*.
 
-It does two jobs from one dependency graph:
+It does three jobs from one dependency graph:
 
 - **`drift check`** — enforce architectural intent (no cycles, layering,
   forbidden dependencies, orphan modules, missing entrypoints).
 - **`drift map`** — emit a JSON understanding artifact (repo map, dependency
   graph, notable files, inferred domains, symbol index) that a coding agent or
   an LLM harness can read to know what to touch before it edits anything.
+- **`drift graph`** — construct a unified multi-domain knowledge graph across code AST,
+  UI bindings, and workflow gates; run graph-theoretic cycle cutting and layer tracing;
+  and synthesize zero-fluff LLM remediation prompts to resolve architectural debt.
 
 ## ⚡ Quickstart
 
 ```bash
 python3 -m pip install -e .
 
-# enforce architecture
-drift check . --json --strict
+# enforce architecture (pass --graph for intelligent remediation advice)
+drift check . --json --strict --graph
 
 # emit the understanding map an agent can consume
 drift map . --output .drift/map.json
+
+# build the semantic knowledge graph
+drift graph build . --output .drift/graph.json
+
+# calculate change impact & blast radius for a module
+drift graph blast-radius . path/to/module.py
+
+# surface renamed functions with similar implementation shapes
+drift graph duplicates . --min-similarity 0.86
+
+# generate a structured LLM remediation prompt for an architectural issue
+drift graph prompt . path/to/violating_file.py
 ```
 
 Clean output is the sound of an architecture staying honest:
@@ -45,11 +60,23 @@ No architecture violations found.
 | `entrypoints-exist` | declared entrypoints that are missing on disk |
 | `canonical-abstractions` | direct use of restricted libraries, primitives, or symbols outside declared canonical modules (forces reuse/abstraction) |
 | `no-duplicate-symbols` | duplicate top-level class or function names across distinct modules (catches copy-pasting and wheel rebuilding) |
+| `no-duplicate-implementations` | similar normalized function shapes across modules, even when names differ (review candidates, not proof of equivalent behavior) |
+| `require-synthetic` | non-exempt code files lacking a companion `.synthetic` file defining user workflows |
+| `no-duplicate-workflows` | duplicate or near-duplicate user-journey workflow step sequences across different modules |
+| `verify-synthetic-alignment` | `.synthetic` declared steps that do not match the AST/token reality in code (prevents synthetic drift) |
 
 `no-cycles` and `orphan-modules` ship on by default. `layering`,
 `forbidden-deps`, `entrypoints-exist`, `canonical-abstractions`, and
-`no-duplicate-symbols` are opt-in — declare your intent in the manifest and they
-enforce it.
+`no-duplicate-symbols`, and `no-duplicate-implementations` are opt-in — declare
+your intent in the manifest and they enforce it.
+
+`no-duplicate-implementations` is also opt-in and defaults to warning severity.
+It compares Python AST shapes and JS/TS token shapes while normalizing local
+names and literal values. Similar control flow, operators, and call patterns
+produce candidates for review; a structural match alone cannot establish that
+two functions have the same behavior. Exclude intentional matches with its
+`allow` path patterns. The standalone `drift graph duplicates` command prints
+the same candidates without changing the check result.
 
 ### 🛡️ Forcing Reusable Abstractions (Anti-Rebuilding The Wheel)
 
@@ -84,6 +111,67 @@ src/features/chat.ts:14: [canonical-webrtc] Direct WebRTC usage is restricted. A
 Moreover, `drift map` automatically includes declared canonical abstractions so
 coding agents inspecting `.drift/map.json` know what reusable abstractions exist
 before writing any new code.
+
+### 🎭 Behavioral & User-Journey Governance (`.synthetic` Companion Files)
+
+Enforcing `.synthetic` companion files shifts `drift-be-gone` from purely structural AST/import governance to **behavioral and user-journey governance** (`require-synthetic` + `no-duplicate-workflows`). Instead of only tracking which module imports which library, the engine and knowledge graph index what the user is actually doing (triggers, intent sequences, state mutations, and outcomes) and flag when two parts of the codebase quietly build parallel flows for the same user capability.
+
+Each source file `foo.py` (or `foo.ts`) can have a sibling `foo.py.synthetic` (or `foo.synthetic`) file:
+
+```json
+{
+  "file": "src/checkout/payment.py",
+  "role": "orchestrator",
+  "workflows": [
+    {
+      "id": "submit-order-payment",
+      "user_intent": "User submits payment details to complete an order",
+      "trigger": "ui.click:checkout_submit_btn",
+      "steps": [
+        "validate:user_input",
+        "verify:auth_session",
+        "mutate:order_state:pending",
+        "external:payment_gateway_charge",
+        "mutate:order_state:completed",
+        "emit:notification_receipt"
+      ],
+      "outcome": "order_paid_and_confirmed"
+    }
+  ]
+}
+```
+
+- **Action-Verb Taxonomy**: Steps are normalized into `<action_type>:<domain_concept>` tokens (`validate:*`, `mutate:*`, `external:*`, `emit:*`, `verify:*`).
+- **`require-synthetic`**: Ensures non-exempt files declare user workflows.
+- **`no-duplicate-workflows`**: Multi-file participation in the same workflow ID is valid, but two different workflow IDs building duplicate or near-duplicate user interaction chains are flagged.
+- **Declarative Escape Hatch (`allow_similar_workflows`)**: If two workflows legitimately share sequences, add `"allow_similar_workflows": ["<other-id>"]` to the workflow definition to suppress near-duplicate warnings in `--strict` mode and remove duplicate graph edges.
+- **`verify-synthetic-alignment`**: Cross-checks `.synthetic` declarations against the code AST/token reality to prevent synthetic drift (e.g., verifying `external:*` calls external I/O or client libraries, `emit:*` dispatches events, and stub files cannot claim orchestrators).
+- **`drift map` Integration**: Emits `canonical_workflows` with user intents, triggers, outcomes, steps, and participating files.
+- **`drift graph prompt` Integration**: Automatically tells coding agents when a target module implements a flow that duplicates an existing workflow and guides them to delegate.
+
+## 🧠 Knowledge Graph & LLM Architectural Resolution
+
+When coding agents face complex architectural debt (e.g. circular dependencies or layer inversions), flat lists of error messages force the agent to spend tens of thousands of tokens guessing how to refactor.
+
+`drift graph` transforms the repository into a unified **Semantic Property Graph**:
+
+- **Multi-Domain Extraction**: Combines Python AST definitions & calls, JS/TS imports & classes, UI `data-action` dispatches, CI workflow gates, and rule violations into one connected ontology.
+- **Cycle Cutter (Feedback Arc Set)**: Projects module cycles down to individual symbol-level calls and calculates minimum-cut seam recommendations (`extract_to_shared`, `dependency_injection`, `dynamic_import`).
+- **Layer Boundary Path Tracer**: Finds direct and transitive breach paths across architectural tiers and suggests interface inversion points.
+- **Blast-Radius & Instability Analysis**: Computes afferent (incoming callers) and efferent (outgoing dependencies) coupling, estimating risk levels before refactoring.
+- **LLM Subgraph Packer**: Emits compact, token-optimized context blocks containing Mermaid flowcharts, minimal-cut candidates, and invariant constraints ready for agent prompt injection.
+- **Implementation Shape Finder**: Finds cross-module functions with similar normalized AST/token structure and includes nearby matches in coding-agent remediation prompts.
+
+```bash
+# Explain a module's neighborhood and risk level
+drift graph explain . src/core/engine.py --mermaid
+
+# Generate an end-to-end prompt for an LLM to resolve a circular dependency
+drift graph prompt . src/core/engine.py
+
+# inspect likely copy-paste candidates by function shape
+drift graph duplicates . --json
+```
 
 ## 🧠 How it works
 

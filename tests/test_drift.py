@@ -540,6 +540,22 @@ class ManifestAndCliTests(unittest.TestCase):
     def test_cli_check_clean_tree(self) -> None:
         root = Path(tempfile.mkdtemp())
         (root / "a.py").write_text("x = 1\n", encoding="utf-8")
+        (root / "a.py.synthetic").write_text(
+            json.dumps(
+                {
+                    "workflows": [
+                        {
+                            "id": "init-flow",
+                            "user_intent": "Initialize component",
+                            "trigger": "app.start",
+                            "steps": ["step:boot", "step:ready"],
+                            "outcome": "ready",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
         self.assertEqual(main(["check", str(root), "--json"]), 0)
 
     def test_cli_map_writes_output(self) -> None:

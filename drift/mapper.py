@@ -46,10 +46,13 @@ def _brief(graph: Graph) -> str:
 
 
 def _extract_abstractions(manifest: dict | None) -> list[dict]:
-    if not manifest:
+    if not isinstance(manifest, dict):
         return []
     items: list[dict] = []
-    for r in manifest.get("rules", []):
+    rules = manifest.get("rules", [])
+    if not isinstance(rules, list):
+        return []
+    for r in rules:
         if not isinstance(r, dict):
             continue
         if r.get("type") != "canonical-abstractions" or not r.get("enabled", True):
@@ -59,13 +62,48 @@ def _extract_abstractions(manifest: dict | None) -> list[dict]:
         {
             "name": a.get("name") or a.get("id") or "unnamed",
             "canonical": a.get("canonical"),
+            "allow": a.get("allow") or [],
             "description": a.get("description", ""),
             "restricted_imports": a.get("restricted_imports") or [],
             "restricted_primitives": a.get("restricted_primitives") or [],
             "restricted_symbols": a.get("restricted_symbols") or [],
+            "require_canonical_exists": a.get("require_canonical_exists", False),
         }
         for a in items
     ]
+
+
+def _extract_workflows(root: Path) -> list[dict]:
+    try:
+        from .synthetic import SyntheticWorkflowGovernance
+
+        gov = SyntheticWorkflowGovernance(
+            root_dir=root,
+            require_synthetic=False,
+            detect_duplicate_patterns=False,
+        )
+        _, patterns = gov.check_repository()
+    except Exception:
+        return []
+
+    workflows_by_id: dict[str, dict] = {}
+    for p in patterns:
+        if p.id not in workflows_by_id:
+            workflows_by_id[p.id] = {
+                "id": p.id,
+                "user_intent": p.user_intent,
+                "trigger": p.trigger,
+                "steps": p.steps,
+                "outcome": p.outcome,
+                "participating_files": [p.source_file],
+            }
+        else:
+            files = workflows_by_id[p.id]["participating_files"]
+            if p.source_file not in files:
+                files.append(p.source_file)
+                files.sort()
+
+    return [workflows_by_id[k] for k in sorted(workflows_by_id.keys())]
 
 
 def build_map(
@@ -89,4 +127,7 @@ def build_map(
     abstractions = _extract_abstractions(manifest)
     if abstractions:
         data["canonical_abstractions"] = abstractions
+    workflows = _extract_workflows(root)
+    if workflows:
+        data["canonical_workflows"] = workflows
     return data

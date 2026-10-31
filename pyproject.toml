@@ -14,7 +14,12 @@ license = { text = "MIT" }
 drift = "drift.cli:main"
 
 [tool.setuptools]
-packages = ["drift"]
+packages = [
+    "drift",
+    "drift.graph",
+    "drift.graph.extractors",
+    "drift.graph.solvers",
+]
 
 [tool.setuptools.package-data]
 drift = ["data/*.json"]

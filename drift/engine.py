@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import io
-import re
 import tokenize
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
 
-from .analyze import Graph, Module, _clean_js_for_primitives, build_graph
+from .analyze import Graph, JSToken, Module, build_graph, lex_js
 
 RULE_TYPES = frozenset(
     {
@@ -20,6 +19,10 @@ RULE_TYPES = frozenset(
         "entrypoints-exist",
         "canonical-abstractions",
         "no-duplicate-symbols",
+        "no-duplicate-implementations",
+        "require-synthetic",
+        "no-duplicate-workflows",
+        "verify-synthetic-alignment",
     }
 )
 
@@ -58,31 +61,75 @@ def _domain_of(path: str) -> str:
     return parts[0]
 
 
-def _find_line_number(path: Path, pattern: str, is_regex: bool = False) -> int | None:
-    try:
-        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except OSError:
-        return None
-    for idx, line in enumerate(lines, start=1):
-        if is_regex:
-            if re.search(pattern, line):
-                return idx
-        elif pattern in line:
-            return idx
-    return None
+def _is_js_expression_end(token: JSToken) -> bool:
+    if token.kind in {"NUMBER", "STRING", "TEMPLATE", "REGEX"}:
+        return True
+    if token.kind == "IDENT":
+        return token.value not in {
+            "await", "case", "delete", "else", "in", "instanceof", "new",
+            "of", "return", "throw", "typeof", "void", "yield",
+        }
+    return token.value in {")", "]", "}", "++", "--"}
 
 
-def _primitive_regex(primitive: str) -> re.Pattern:
-    if "." in primitive:
-        parts = primitive.split(".")
-        sub = [
-            rf"(?:\.\s*|\?\.\s*|\[\s*['\"]){re.escape(p)}(?:['\"]\s*\])?"
-            for p in parts[1:]
-        ]
-        pattern = rf"\b{re.escape(parts[0])}" + "".join(sub) + r"(?!\w)"
-    else:
-        pattern = rf"(?:\b{re.escape(primitive)}\b|\[\s*['\"]{re.escape(primitive)}['\"]\s*\])"
-    return re.compile(pattern)
+def _is_js_computed_property(tokens: list[JSToken], bracket: int) -> bool:
+    if bracket >= 2 and tokens[bracket - 1].value == "?.":
+        return _is_js_expression_end(tokens[bracket - 2])
+    return bracket > 0 and _is_js_expression_end(tokens[bracket - 1])
+
+
+def _match_js_primitive_path(tokens: list[JSToken], start: int, parts: list[str]) -> bool:
+    index = start + 1
+    for part in parts[1:]:
+        if index >= len(tokens):
+            return False
+        if tokens[index].value in {".", "?."}:
+            index += 1
+            if index < len(tokens) and tokens[index].kind == "IDENT" and tokens[index].value == part:
+                index += 1
+            elif (
+                tokens[index - 1].value == "?."
+                and index + 2 < len(tokens)
+                and tokens[index].value == "["
+                and tokens[index + 1].kind == "STRING"
+                and tokens[index + 1].value == part
+                and tokens[index + 2].value == "]"
+            ):
+                index += 3
+            else:
+                return False
+        elif (
+            index + 2 < len(tokens)
+            and tokens[index].value == "["
+            and tokens[index + 1].kind == "STRING"
+            and tokens[index + 1].value == part
+            and tokens[index + 2].value == "]"
+        ):
+            index += 3
+        else:
+            return False
+    return True
+
+
+def _js_primitive_lines(tokens: list[JSToken], primitive: str) -> list[int]:
+    parts = primitive.split(".")
+    lines: set[int] = set()
+    for index, token in enumerate(tokens):
+        if token.kind == "IDENT" and token.value == parts[0]:
+            if _match_js_primitive_path(tokens, index, parts):
+                lines.add(token.line)
+        if (
+            len(parts) == 1
+            and token.kind == "STRING"
+            and token.value == primitive
+            and index > 0
+            and index + 1 < len(tokens)
+            and tokens[index - 1].value == "["
+            and tokens[index + 1].value == "]"
+            and _is_js_computed_property(tokens, index - 1)
+        ):
+            lines.add(tokens[index - 1].line)
+    return sorted(lines)
 
 
 def _find_py_primitive_lines(code: str, primitive: str) -> list[int]:
@@ -115,12 +162,7 @@ def _find_py_primitive_lines(code: str, primitive: str) -> list[int]:
 
 
 def _find_js_primitive_lines(code: str, primitive: str) -> list[int]:
-    cleaned = _clean_js_for_primitives(code)
-    pattern = _primitive_regex(primitive)
-    lines: list[int] = []
-    for match in pattern.finditer(cleaned):
-        lines.append(cleaned[:match.start()].count("\n") + 1)
-    return sorted(set(lines))
+    return _js_primitive_lines(lex_js(code), primitive)
 
 
 def _find_cycles(graph: Graph) -> list[list[str]]:
@@ -279,11 +321,12 @@ def _check_restricted_primitives(
 
     out: list[Violation] = []
     is_py = rel.endswith(".py")
+    js_tokens = None if is_py else lex_js(file_text)
     for primitive in restricted_primitives:
         if is_py:
             lines = _find_py_primitive_lines(file_text, primitive)
         else:
-            lines = _find_js_primitive_lines(file_text, primitive)
+            lines = _js_primitive_lines(js_tokens, primitive)
         for line_no in lines:
             msg = custom_message or (
                 f"direct use of restricted primitive '{primitive}' is restricted outside "
@@ -307,7 +350,6 @@ def _check_restricted_symbols(
     rule_id: str,
     rel: str,
     module: Module,
-    file_path: Path,
     item: dict,
     canonical_display: str,
 ) -> list[Violation]:
@@ -320,24 +362,21 @@ def _check_restricted_symbols(
     for sym in restricted_symbols:
         if sym not in declared:
             continue
-        line = _find_line_number(
-            file_path,
-            rf"^\s*(?:export\s+)?(?:async\s+)?(def|class|function|const|let|var)\s+{re.escape(sym)}\b",
-            is_regex=True,
-        ) or _find_line_number(file_path, sym)
         msg = custom_message or (
             f"symbol '{sym}' must only be defined in canonical path '{canonical_display}'."
         )
-        out.append(
-            Violation(
-                rule_id=rule_id,
-                path=rel,
-                line=line,
-                message=msg,
-                restriction=sym,
-                canonical=canonical_display,
+        lines = [line for name, line in module.symbol_locations if name == sym]
+        for line in lines or [None]:
+            out.append(
+                Violation(
+                    rule_id=rule_id,
+                    path=rel,
+                    line=line,
+                    message=msg,
+                    restriction=sym,
+                    canonical=canonical_display,
+                )
             )
-        )
     return out
 
 
@@ -376,29 +415,33 @@ def _scan_abstraction(
         file_path = root / rel
         out.extend(_check_restricted_imports(rule_id, rel, module, file_path, item, canonical_display))
         out.extend(_check_restricted_primitives(rule_id, rel, file_path, item, canonical_display))
-        out.extend(_check_restricted_symbols(rule_id, rel, module, file_path, item, canonical_display))
+        out.extend(_check_restricted_symbols(rule_id, rel, module, item, canonical_display))
     return out
 
 
 def _normalize_abstractions(rule: dict) -> list[dict]:
-    rule_canonical = rule.get("canonical")
-    rule_allow = rule.get("allow")
-    rule_message = rule.get("message")
     rule_id = rule.get("id", "canonical-abstractions")
+    inherited_fields = (
+        "canonical",
+        "allow",
+        "message",
+        "description",
+        "restricted_imports",
+        "restricted_primitives",
+        "restricted_symbols",
+        "require_canonical_exists",
+    )
 
     raw = rule.get("abstractions")
     if isinstance(raw, list):
         items: list[dict] = []
-        for idx, item in enumerate(raw):
+        for item in raw:
             if not isinstance(item, dict):
                 continue
             merged = dict(item)
-            if merged.get("canonical") is None and rule_canonical is not None:
-                merged["canonical"] = rule_canonical
-            if merged.get("allow") is None and rule_allow is not None:
-                merged["allow"] = rule_allow
-            if merged.get("message") is None and rule_message is not None:
-                merged["message"] = rule_message
+            for field_name in inherited_fields:
+                if merged.get(field_name) is None and field_name in rule:
+                    merged[field_name] = rule[field_name]
             if not merged.get("name") and not merged.get("id"):
                 merged["name"] = rule_id
             items.append(merged)
@@ -449,17 +492,128 @@ def _no_duplicate_symbols(rule: dict, graph: Graph, root: Path) -> list[Violatio
             continue
         paths_str = ", ".join(sorted(paths))
         for path in sorted(paths):
-            line = _find_line_number(
-                root / path,
-                rf"^\s*(?:export\s+)?(?:async\s+)?(def|class|function|const|let|var)\s+{re.escape(sym)}\b",
-                is_regex=True,
-            ) or _find_line_number(root / path, sym)
             msg = (
                 f"duplicate symbol '{sym}' defined in multiple modules: {paths_str}. "
                 f"Abstract into a shared module and reuse."
             )
+            module = graph.modules[path]
+            line = next((ln for name, ln in module.symbol_locations if name == sym), None)
             out.append(Violation(rule_id=rule_id, path=path, line=line, message=msg, restriction=sym))
     return out
+
+
+def _no_duplicate_implementations(rule: dict, graph: Graph, root: Path) -> list[Violation]:
+    from .graph import build_knowledge_graph, find_duplicate_implementations
+
+    rule_id = rule.get("id", "no-duplicate-implementations")
+    allow = _normalize_patterns(
+        rule.get("allow", ["tests/**", "**/*test*", "**/*_test.py", "**/*.test.*"])
+    )
+    kg = build_knowledge_graph(root, include_violations=False)
+    matches = find_duplicate_implementations(
+        kg,
+        min_similarity=rule.get("min_similarity", 0.86),
+        min_features=rule.get("min_features", 8),
+        ignore_paths=allow,
+    )
+
+    out: list[Violation] = []
+    for match in matches:
+        left, right = match.left, match.right
+        for current, other in ((left, right), (right, left)):
+            out.append(
+                Violation(
+                    rule_id=rule_id,
+                    path=current["path"],
+                    line=current["line"],
+                    message=(
+                        f"implementation shape is {match.similarity:.0%} similar to "
+                        f"'{other['name']}' in {other['path']}:{other['line']}; "
+                        "review whether both should use one shared abstraction"
+                    ),
+                    restriction="implementation-shape",
+                )
+            )
+    return out
+
+
+def _require_synthetic(rule: dict, graph: Graph, root: Path) -> list[Violation]:
+    from .synthetic import SyntheticWorkflowGovernance
+
+    rule_id = rule.get("id", "require-synthetic")
+    exempt = _normalize_patterns(rule.get("allow") or rule.get("exempt") or ["tests/**", "**/__init__.py", "drift/**"])
+    gov = SyntheticWorkflowGovernance(
+        root_dir=root,
+        exempt_globs=tuple(exempt),
+        require_synthetic=True,
+        detect_duplicate_patterns=False,
+    )
+    violations, _ = gov.check_repository()
+    return [
+        Violation(
+            rule_id=rule_id,
+            path=v.file,
+            line=None,
+            message=v.message,
+            severity=rule.get("severity", v.severity),
+            restriction=v.workflow_id,
+        )
+        for v in violations
+    ]
+
+
+def _no_duplicate_workflows(rule: dict, graph: Graph, root: Path) -> list[Violation]:
+    from .synthetic import SyntheticWorkflowGovernance
+
+    rule_id = rule.get("id", "no-duplicate-workflows")
+    exempt = _normalize_patterns(rule.get("allow") or rule.get("exempt") or ["tests/**", "**/__init__.py", "drift/**"])
+    min_sim = float(rule.get("min_similarity", 0.85))
+    gov = SyntheticWorkflowGovernance(
+        root_dir=root,
+        exempt_globs=tuple(exempt),
+        min_pattern_similarity=min_sim,
+        require_synthetic=False,
+        detect_duplicate_patterns=True,
+    )
+    violations, _ = gov.check_repository()
+    return [
+        Violation(
+            rule_id=rule_id,
+            path=v.file,
+            line=None,
+            message=v.message,
+            severity=rule.get("severity", v.severity),
+            restriction=v.workflow_id,
+        )
+        for v in violations
+    ]
+
+
+def _verify_synthetic_alignment(rule: dict, graph: Graph, root: Path) -> list[Violation]:
+    from .synthetic import SyntheticWorkflowGovernance
+
+    rule_id = rule.get("id", "verify-synthetic-alignment")
+    exempt = _normalize_patterns(rule.get("allow") or rule.get("exempt") or ["tests/**", "**/__init__.py", "drift/**", "examples/**"])
+    gov = SyntheticWorkflowGovernance(
+        root_dir=root,
+        exempt_globs=tuple(exempt),
+        require_synthetic=False,
+        detect_duplicate_patterns=False,
+        verify_alignment=True,
+    )
+    violations, _ = gov.check_repository()
+    return [
+        Violation(
+            rule_id=rule_id,
+            path=v.file,
+            line=None,
+            message=v.message,
+            severity=rule.get("severity", v.severity),
+            restriction=v.workflow_id,
+        )
+        for v in violations
+        if v.rule == "verify-synthetic-alignment"
+    ]
 
 
 _RULES = {
@@ -470,13 +624,18 @@ _RULES = {
     "entrypoints-exist": _entrypoints_exist,
     "canonical-abstractions": _canonical_abstractions,
     "no-duplicate-symbols": _no_duplicate_symbols,
+    "no-duplicate-implementations": _no_duplicate_implementations,
+    "require-synthetic": _require_synthetic,
+    "no-duplicate-workflows": _no_duplicate_workflows,
+    "verify-synthetic-alignment": _verify_synthetic_alignment,
 }
 
 
 class RuleEngine:
     def __init__(self, manifest: dict):
-        self.manifest = manifest
-        self.rules = [r for r in manifest.get("rules", []) if isinstance(r, dict) and r.get("enabled", True)]
+        self.manifest = manifest if isinstance(manifest, dict) else {}
+        rules = self.manifest.get("rules", [])
+        self.rules = [r for r in rules if isinstance(r, dict) and r.get("enabled", True)] if isinstance(rules, list) else []
 
     def scan(self, root: Path, strict: bool = False, graph: Graph | None = None) -> list[Violation]:
         problems = validate_manifest(self.manifest)
@@ -502,6 +661,48 @@ class RuleEngine:
             for violation in found:
                 violation.severity = severity
             violations.extend(found)
+
+        # Support top-level synthetic_workflows configuration
+        if "synthetic_workflows" in self.manifest and isinstance(self.manifest["synthetic_workflows"], dict):
+            sw_config = self.manifest["synthetic_workflows"]
+            req_syn = sw_config.get("require_synthetic", True)
+            det_dup = sw_config.get("detect_duplicate_patterns", True)
+            ver_align = sw_config.get("verify_alignment", False)
+            min_sim = float(sw_config.get("min_similarity", 0.85))
+            exempt = _normalize_patterns(sw_config.get("exempt", ["tests/**", "drift/**", "examples/**", "**/__init__.py"]))
+
+            has_req_rule = any(r.get("type") == "require-synthetic" for r in self.rules)
+            has_dup_rule = any(r.get("type") == "no-duplicate-workflows" for r in self.rules)
+            has_align_rule = any(r.get("type") == "verify-synthetic-alignment" for r in self.rules)
+
+            run_req = req_syn and not has_req_rule
+            run_dup = det_dup and not has_dup_rule
+            run_align = ver_align and not has_align_rule
+
+            if run_req or run_dup or run_align:
+                from .synthetic import SyntheticWorkflowGovernance
+
+                gov = SyntheticWorkflowGovernance(
+                    root_dir=root,
+                    exempt_globs=tuple(exempt),
+                    min_pattern_similarity=min_sim,
+                    require_synthetic=run_req,
+                    detect_duplicate_patterns=run_dup,
+                    verify_alignment=run_align,
+                )
+                syn_violations, _ = gov.check_repository()
+                for sv in syn_violations:
+                    violations.append(
+                        Violation(
+                            rule_id=sv.rule,
+                            path=sv.file,
+                            line=None,
+                            message=sv.message,
+                            severity=sv.severity,
+                            restriction=sv.workflow_id,
+                        )
+                    )
+
         if strict:
             return violations
         return [v for v in violations if v.severity == "error"]
@@ -534,6 +735,26 @@ def _validate_str_list(val: object, field_name: str, label: str, problems: list[
             problems.append(f"{label}: '{field_name}[{idx}]' must be a non-empty string")
 
 
+def _validate_canonical_patterns(val: object, label: str, problems: list[str]) -> None:
+    _validate_str_or_str_list(val, "canonical", label, problems)
+    if isinstance(val, list) and not val:
+        problems.append(f"{label}: 'canonical' must contain at least one path pattern")
+
+
+def _has_abstraction_policy(item: dict, parent: dict | None = None) -> bool:
+    fields = ("restricted_imports", "restricted_primitives", "restricted_symbols")
+    for field_name in fields:
+        value = item.get(field_name)
+        if value is None and parent is not None:
+            value = parent.get(field_name)
+        if value:
+            return True
+    required = item.get("require_canonical_exists")
+    if required is None and parent is not None:
+        required = parent.get("require_canonical_exists")
+    return required is True
+
+
 def _validate_abstraction_item(
     abs_item: object, a_label: str, parent_has_canonical: bool, problems: list[str]
 ) -> None:
@@ -543,7 +764,7 @@ def _validate_abstraction_item(
     if "canonical" not in abs_item and not parent_has_canonical:
         problems.append(f"{a_label}: must define 'canonical'")
     if "canonical" in abs_item:
-        _validate_str_or_str_list(abs_item.get("canonical"), "canonical", a_label, problems)
+        _validate_canonical_patterns(abs_item.get("canonical"), a_label, problems)
     if "allow" in abs_item:
         _validate_str_or_str_list(abs_item.get("allow"), "allow", a_label, problems)
     if "restricted_imports" in abs_item:
@@ -552,6 +773,19 @@ def _validate_abstraction_item(
         _validate_str_list(abs_item.get("restricted_primitives"), "restricted_primitives", a_label, problems)
     if "restricted_symbols" in abs_item:
         _validate_str_list(abs_item.get("restricted_symbols"), "restricted_symbols", a_label, problems)
+    if "message" in abs_item and (
+        not isinstance(abs_item["message"], str) or not abs_item["message"].strip()
+    ):
+        problems.append(f"{a_label}: 'message' must be a non-empty string")
+    for field_name in ("name", "id"):
+        if field_name in abs_item and (
+            not isinstance(abs_item[field_name], str) or not abs_item[field_name].strip()
+        ):
+            problems.append(f"{a_label}: '{field_name}' must be a non-empty string")
+    if "description" in abs_item and not isinstance(abs_item["description"], str):
+        problems.append(f"{a_label}: 'description' must be a string")
+    if "require_canonical_exists" in abs_item and not isinstance(abs_item["require_canonical_exists"], bool):
+        problems.append(f"{a_label}: 'require_canonical_exists' must be a boolean")
 
 
 def _validate_canonical_rule(rule: dict, label: str, problems: list[str]) -> None:
@@ -560,28 +794,127 @@ def _validate_canonical_rule(rule: dict, label: str, problems: list[str]) -> Non
         if not isinstance(abstractions, list):
             problems.append(f"{label}: 'abstractions' must be an array")
             return
+        if not abstractions and rule.get("enabled", True):
+            problems.append(f"{label}: enabled rule must define at least one abstraction")
+        if "canonical" in rule:
+            _validate_canonical_patterns(rule["canonical"], label, problems)
+        if "allow" in rule:
+            _validate_str_or_str_list(rule["allow"], "allow", label, problems)
+        if "message" in rule and (not isinstance(rule["message"], str) or not rule["message"].strip()):
+            problems.append(f"{label}: 'message' must be a non-empty string")
+        for field_name in ("restricted_imports", "restricted_primitives", "restricted_symbols"):
+            if field_name in rule:
+                _validate_str_list(rule[field_name], field_name, label, problems)
+        if "require_canonical_exists" in rule and not isinstance(rule["require_canonical_exists"], bool):
+            problems.append(f"{label}: 'require_canonical_exists' must be a boolean")
         for a_idx, abs_item in enumerate(abstractions):
             a_sub_label = f"{label}.abstractions[{a_idx}]"
             _validate_abstraction_item(abs_item, a_sub_label, "canonical" in rule, problems)
+            if (
+                rule.get("enabled", True)
+                and isinstance(abs_item, dict)
+                and not _has_abstraction_policy(abs_item, rule)
+            ):
+                problems.append(f"{a_sub_label}: must define at least one restriction")
         return
     if "canonical" in rule:
         _validate_abstraction_item(rule, label, True, problems)
+        if rule.get("enabled", True) and not _has_abstraction_policy(rule):
+            problems.append(f"{label}: enabled rule must define at least one restriction")
         return
     problems.append(f"{label}: must define 'canonical' or 'abstractions'")
 
 
 def validate_manifest(manifest: dict) -> list[str]:
     problems: list[str] = []
+    if not isinstance(manifest, dict):
+        return ["manifest must be an object"]
     rules = manifest.get("rules")
     if not isinstance(rules, list) or not rules:
         return ["manifest must define a non-empty 'rules' array"]
+
+    if "synthetic_workflows" in manifest:
+        sw = manifest["synthetic_workflows"]
+        if not isinstance(sw, dict):
+            problems.append("'synthetic_workflows' must be an object")
+        else:
+            if "require_synthetic" in sw and not isinstance(sw["require_synthetic"], bool):
+                problems.append("'synthetic_workflows.require_synthetic' must be a boolean")
+            if "detect_duplicate_patterns" in sw and not isinstance(sw["detect_duplicate_patterns"], bool):
+                problems.append("'synthetic_workflows.detect_duplicate_patterns' must be a boolean")
+            if "verify_alignment" in sw and not isinstance(sw["verify_alignment"], bool):
+                problems.append("'synthetic_workflows.verify_alignment' must be a boolean")
+            if "min_similarity" in sw:
+                ms = sw["min_similarity"]
+                if isinstance(ms, bool) or not isinstance(ms, (int, float)) or not 0 < ms <= 1:
+                    problems.append("'synthetic_workflows.min_similarity' must be a float between 0 and 1")
+            if "exempt" in sw:
+                _validate_str_list(sw["exempt"], "exempt", "synthetic_workflows", problems)
+
     for index, rule in enumerate(rules):
-        label = rule.get("id", f"rule[{index}]")
+        if not isinstance(rule, dict):
+            problems.append(f"rule[{index}] must be an object")
+            continue
+        raw_label = rule.get("id")
+        label = raw_label if isinstance(raw_label, str) and raw_label.strip() else f"rule[{index}]"
+        if "id" in rule and (not isinstance(raw_label, str) or not raw_label.strip()):
+            problems.append(f"rule[{index}]: 'id' must be a non-empty string")
         rtype = rule.get("type")
-        if rtype not in RULE_TYPES:
+        if not isinstance(rtype, str) or rtype not in RULE_TYPES:
             problems.append(f"{label}: unknown rule type {rtype!r}")
-        if rule.get("severity", "error") not in {"error", "warning"}:
+        severity = rule.get("severity", "error")
+        if not isinstance(severity, str) or severity not in {"error", "warning"}:
             problems.append(f"{label}: severity must be error or warning")
+        if "enabled" in rule and not isinstance(rule["enabled"], bool):
+            problems.append(f"{label}: 'enabled' must be a boolean")
+        if "description" in rule and not isinstance(rule["description"], str):
+            problems.append(f"{label}: 'description' must be a string")
         if rtype == "canonical-abstractions":
             _validate_canonical_rule(rule, label, problems)
+        elif rtype == "no-duplicate-symbols":
+            if "allow" in rule:
+                _validate_str_or_str_list(rule["allow"], "allow", label, problems)
+            if "ignore" in rule:
+                _validate_str_list(rule["ignore"], "ignore", label, problems)
+            min_length = rule.get("min_length", 4)
+            if isinstance(min_length, bool) or not isinstance(min_length, int) or min_length < 1:
+                problems.append(f"{label}: 'min_length' must be a positive integer")
+            if "allow_same_domain" in rule and not isinstance(rule["allow_same_domain"], bool):
+                problems.append(f"{label}: 'allow_same_domain' must be a boolean")
+        elif rtype == "no-duplicate-implementations":
+            if "allow" in rule:
+                _validate_str_or_str_list(rule["allow"], "allow", label, problems)
+            min_similarity = rule.get("min_similarity", 0.86)
+            if (
+                isinstance(min_similarity, bool)
+                or not isinstance(min_similarity, (int, float))
+                or not 0 < min_similarity <= 1
+            ):
+                problems.append(f"{label}: 'min_similarity' must be greater than 0 and at most 1")
+            min_features = rule.get("min_features", 8)
+            if isinstance(min_features, bool) or not isinstance(min_features, int) or min_features < 1:
+                problems.append(f"{label}: 'min_features' must be a positive integer")
+        elif rtype == "require-synthetic":
+            if "allow" in rule:
+                _validate_str_or_str_list(rule["allow"], "allow", label, problems)
+            if "exempt" in rule:
+                _validate_str_or_str_list(rule["exempt"], "exempt", label, problems)
+        elif rtype == "no-duplicate-workflows":
+            if "allow" in rule:
+                _validate_str_or_str_list(rule["allow"], "allow", label, problems)
+            if "exempt" in rule:
+                _validate_str_or_str_list(rule["exempt"], "exempt", label, problems)
+            if "min_similarity" in rule:
+                ms = rule["min_similarity"]
+                if (
+                    isinstance(ms, bool)
+                    or not isinstance(ms, (int, float))
+                    or not 0 < ms <= 1
+                ):
+                    problems.append(f"{label}: 'min_similarity' must be greater than 0 and at most 1")
+        elif rtype == "verify-synthetic-alignment":
+            if "allow" in rule:
+                _validate_str_or_str_list(rule["allow"], "allow", label, problems)
+            if "exempt" in rule:
+                _validate_str_or_str_list(rule["exempt"], "exempt", label, problems)
     return problems

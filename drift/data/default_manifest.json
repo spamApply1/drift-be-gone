@@ -1,5 +1,12 @@
 {
   "version": 1,
+  "synthetic_workflows": {
+    "require_synthetic": true,
+    "detect_duplicate_patterns": true,
+    "verify_alignment": false,
+    "min_similarity": 0.85,
+    "exempt": ["tests/**", "drift/**", "examples/**", "**/__init__.py"]
+  },
   "rules": [
     {
       "id": "no-cycles",
@@ -126,6 +133,81 @@
       "why": "Duplicate symbols across feature modules signal copy-pasting instead of abstraction.",
       "source_refs": [
         "drift-be-gone/no-duplicate-symbols"
+      ]
+    },
+    {
+      "id": "no-duplicate-implementations",
+      "type": "no-duplicate-implementations",
+      "enabled": false,
+      "severity": "warning",
+      "min_similarity": 0.86,
+      "min_features": 8,
+      "allow": [
+        "tests/**",
+        "**/*test*",
+        "**/*_test.py",
+        "**/*.test.*"
+      ],
+      "description": "Similar function implementation shapes should be reviewed for a shared abstraction.",
+      "what": "Finds cross-module functions with highly similar normalized control, operator, and call patterns.",
+      "why": "Renamed copy-paste can evade duplicate symbol-name checks while rebuilding the same capability.",
+      "source_refs": [
+        "drift-be-gone/no-duplicate-implementations"
+      ]
+    },
+    {
+      "id": "require-synthetic",
+      "type": "require-synthetic",
+      "enabled": false,
+      "severity": "error",
+      "allow": [
+        "tests/**",
+        "drift/**",
+        "examples/**",
+        "**/__init__.py"
+      ],
+      "description": "Governed source files must have companion .synthetic files defining user workflows.",
+      "what": "Verifies that source files have a sibling .synthetic file declaring user-journey workflows.",
+      "why": "Enforces intentional behavioral documentation and enables user-journey governance.",
+      "source_refs": [
+        "drift-be-gone/require-synthetic"
+      ]
+    },
+    {
+      "id": "no-duplicate-workflows",
+      "type": "no-duplicate-workflows",
+      "enabled": false,
+      "severity": "error",
+      "min_similarity": 0.85,
+      "allow": [
+        "tests/**",
+        "drift/**",
+        "examples/**",
+        "**/__init__.py"
+      ],
+      "description": "User workflows must not duplicate intent and step sequences across parallel implementations.",
+      "what": "Detects duplicate or near-duplicate user workflow patterns across different modules.",
+      "why": "Prevents parallel user flows and fragmented customer journeys.",
+      "source_refs": [
+        "drift-be-gone/no-duplicate-workflows"
+      ]
+    },
+    {
+      "id": "verify-synthetic-alignment",
+      "type": "verify-synthetic-alignment",
+      "enabled": false,
+      "severity": "warning",
+      "allow": [
+        "tests/**",
+        "drift/**",
+        "examples/**",
+        "**/__init__.py"
+      ],
+      "description": "Declared .synthetic workflow steps must align with code AST and token reality.",
+      "what": "Cross-checks external:* and emit:* steps and validates that declared orchestrators are not empty stubs.",
+      "why": "Prevents synthetic drift where .synthetic companion files become stale or hallucinated.",
+      "source_refs": [
+        "drift-be-gone/verify-synthetic-alignment"
       ]
     }
   ]
