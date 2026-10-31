@@ -108,6 +108,113 @@ class ArchitectureRuleTests(unittest.TestCase):
         violations = RuleEngine(manifest).scan(self.root, strict=True)
         self.assertTrue(any(v.rule_id == "entrypoints-exist" for v in violations))
 
+    def test_canonical_abstraction_blocks_restricted_import(self) -> None:
+        self._write("shared/rtc/client.py", "import aiortc\n")
+        self._write("features/call.py", "import aiortc\n")
+        manifest = {
+            "rules": [
+                {
+                    "id": "canonical-webrtc",
+                    "type": "canonical-abstractions",
+                    "severity": "error",
+                    "canonical": "shared/rtc/**",
+                    "restricted_imports": ["aiortc"],
+                }
+            ]
+        }
+        violations = RuleEngine(manifest).scan(self.root, strict=True)
+        self.assertEqual(len(violations), 1)
+        self.assertEqual(violations[0].path, "features/call.py")
+        self.assertEqual(violations[0].line, 1)
+        self.assertIn("aiortc", violations[0].message)
+
+    def test_canonical_abstraction_allows_canonical_and_test_usage(self) -> None:
+        self._write("shared/rtc/client.py", "import aiortc\n")
+        self._write("tests/test_call.py", "import aiortc\n")
+        manifest = {
+            "rules": [
+                {
+                    "id": "canonical-webrtc",
+                    "type": "canonical-abstractions",
+                    "severity": "error",
+                    "canonical": "shared/rtc/**",
+                    "restricted_imports": ["aiortc"],
+                }
+            ]
+        }
+        violations = RuleEngine(manifest).scan(self.root, strict=True)
+        self.assertEqual(violations, [])
+
+    def test_canonical_abstraction_blocks_restricted_primitives(self) -> None:
+        self._write("shared/rtc/webrtc.ts", "const pc = new RTCPeerConnection();\n")
+        self._write("features/chat.ts", "// chat tool\nconst pc = new RTCPeerConnection();\n")
+        manifest = {
+            "rules": [
+                {
+                    "id": "canonical-webrtc",
+                    "type": "canonical-abstractions",
+                    "severity": "error",
+                    "canonical": "shared/rtc/**",
+                    "restricted_primitives": ["RTCPeerConnection"],
+                }
+            ]
+        }
+        violations = RuleEngine(manifest).scan(self.root, strict=True)
+        self.assertEqual(len(violations), 1)
+        self.assertEqual(violations[0].path, "features/chat.ts")
+        self.assertEqual(violations[0].line, 2)
+        self.assertIn("RTCPeerConnection", violations[0].message)
+
+    def test_canonical_abstraction_require_canonical_exists(self) -> None:
+        self._write("features/chat.py", "x = 1\n")
+        manifest = {
+            "rules": [
+                {
+                    "id": "canonical-webrtc",
+                    "type": "canonical-abstractions",
+                    "severity": "error",
+                    "canonical": "shared/rtc/**",
+                    "require_canonical_exists": True,
+                }
+            ]
+        }
+        violations = RuleEngine(manifest).scan(self.root, strict=True)
+        self.assertTrue(any("no matching files exist on disk" in v.message for v in violations))
+
+    def test_no_duplicate_symbols_detected(self) -> None:
+        self._write("tools/chat.py", "class WebRTCChat:\n    pass\n")
+        self._write("app/video.py", "class WebRTCChat:\n    pass\n")
+        manifest = {
+            "rules": [
+                {
+                    "id": "no-duplicate-symbols",
+                    "type": "no-duplicate-symbols",
+                    "severity": "error",
+                }
+            ]
+        }
+        violations = RuleEngine(manifest).scan(self.root, strict=True)
+        self.assertEqual(len(violations), 2)
+        paths = {v.path for v in violations}
+        self.assertEqual(paths, {"tools/chat.py", "app/video.py"})
+        self.assertTrue(all(v.line == 1 for v in violations))
+        self.assertTrue(all("WebRTCChat" in v.message for v in violations))
+
+    def test_no_duplicate_symbols_ignored_for_tests(self) -> None:
+        self._write("tools/chat.py", "class WebRTCChat:\n    pass\n")
+        self._write("tests/test_chat.py", "class WebRTCChat:\n    pass\n")
+        manifest = {
+            "rules": [
+                {
+                    "id": "no-duplicate-symbols",
+                    "type": "no-duplicate-symbols",
+                    "severity": "error",
+                }
+            ]
+        }
+        violations = RuleEngine(manifest).scan(self.root, strict=True)
+        self.assertEqual(violations, [])
+
 
 class MapTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -126,6 +233,24 @@ class MapTests(unittest.TestCase):
         self.assertIn(["pkg/a.py", "pkg/b.py"], artifact["graph_edges"])
         self.assertIn("pkg", artifact["inferred_domains"])
         self.assertTrue(artifact["synthetic_brief"])
+
+    def test_map_includes_canonical_abstractions(self) -> None:
+        self._write("pkg/a.py", "x = 1\n")
+        manifest = {
+            "rules": [
+                {
+                    "id": "canonical-webrtc",
+                    "type": "canonical-abstractions",
+                    "canonical": "shared/rtc/**",
+                    "restricted_primitives": ["RTCPeerConnection"],
+                }
+            ]
+        }
+        artifact = build_map(self.root, manifest=manifest)
+        self.assertIn("canonical_abstractions", artifact)
+        self.assertEqual(len(artifact["canonical_abstractions"]), 1)
+        self.assertEqual(artifact["canonical_abstractions"][0]["name"], "canonical-webrtc")
+        self.assertEqual(artifact["canonical_abstractions"][0]["canonical"], "shared/rtc/**")
 
 
 class ManifestAndCliTests(unittest.TestCase):

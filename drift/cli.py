@@ -29,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--strict", action="store_true", help="fail on warnings too")
     mapper = subparsers.add_parser("map", help="emit the understanding artifact")
     mapper.add_argument("repo_root", help="repository root to map")
+    mapper.add_argument("--manifest", default=None, help="path to a custom manifest")
     mapper.add_argument("--output", default=None, help="write the map JSON to a file")
     validate = subparsers.add_parser("validate", help="validate a manifest")
     validate.add_argument("--manifest", default=None, help="path to a custom manifest")
@@ -44,13 +45,23 @@ def _run_check(args: argparse.Namespace) -> int:
         print("No architecture violations found.")
     else:
         for v in violations:
-            print(f"{v.path}: [{v.rule_id}] {v.message}")
+            loc = f"{v.path}:{v.line}" if v.line is not None else v.path
+            print(f"{loc}: [{v.rule_id}] {v.message}")
     return 1 if violations else 0
 
 
 def _run_map(args: argparse.Namespace) -> int:
     root = Path(args.repo_root).expanduser()
-    artifact = build_map(root, build_graph(root))
+    manifest = None
+    manifest_arg = getattr(args, "manifest", None)
+    if manifest_arg:
+        manifest = _load_manifest(manifest_arg)
+    elif _DEFAULT_MANIFEST.exists():
+        try:
+            manifest = _load_manifest(None)
+        except (OSError, json.JSONDecodeError):
+            manifest = None
+    artifact = build_map(root, build_graph(root), manifest=manifest)
     text = json.dumps(artifact, indent=2)
     if args.output:
         Path(args.output).expanduser().write_text(text + "\n", encoding="utf-8")

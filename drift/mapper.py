@@ -44,12 +44,40 @@ def _brief(graph: Graph) -> str:
     )
 
 
-def build_map(root: Path, graph: Graph | None = None) -> dict:
+def _extract_abstractions(manifest: dict | None) -> list[dict]:
+    if not manifest:
+        return []
+    items: list[dict] = []
+    for r in manifest.get("rules", []):
+        if r.get("type") != "canonical-abstractions" or not r.get("enabled", True):
+            continue
+        abstractions = r.get("abstractions")
+        if isinstance(abstractions, list):
+            items.extend(abstractions)
+        elif "canonical" in r:
+            items.append(r)
+    return [
+        {
+            "name": a.get("name") or a.get("id", "unnamed"),
+            "canonical": a.get("canonical"),
+            "description": a.get("description", ""),
+            "restricted_imports": a.get("restricted_imports", []),
+            "restricted_primitives": a.get("restricted_primitives", []),
+        }
+        for a in items
+    ]
+
+
+def build_map(
+    root: Path,
+    graph: Graph | None = None,
+    manifest: dict | None = None,
+) -> dict:
     """Return a JSON-friendly understanding artifact for *root*."""
 
     graph = graph or build_graph(root)
     notable = _notable_files(graph)
-    return {
+    data = {
         "summary": f"Understanding map for {root.name}",
         "synthetic_brief": _brief(graph),
         "inferred_domains": graph.domains(),
@@ -58,3 +86,7 @@ def build_map(root: Path, graph: Graph | None = None) -> dict:
         "graph_edges": [list(edge) for edge in graph.edges],
         "symbol_index": _symbol_index(graph),
     }
+    abstractions = _extract_abstractions(manifest)
+    if abstractions:
+        data["canonical_abstractions"] = abstractions
+    return data

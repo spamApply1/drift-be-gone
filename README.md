@@ -43,10 +43,47 @@ No architecture violations found.
 | `forbidden-deps` | any import matching a forbidden `from` → `to` path pair |
 | `orphan-modules` | modules nothing imports (dead code / missing wiring) |
 | `entrypoints-exist` | declared entrypoints that are missing on disk |
+| `canonical-abstractions` | direct use of restricted libraries, primitives, or symbols outside declared canonical modules (forces reuse/abstraction) |
+| `no-duplicate-symbols` | duplicate top-level class or function names across distinct modules (catches copy-pasting and wheel rebuilding) |
 
 `no-cycles` and `orphan-modules` ship on by default. `layering`,
-`forbidden-deps`, and `entrypoints-exist` are opt-in — declare your intent in
-the manifest and they enforce it.
+`forbidden-deps`, `entrypoints-exist`, `canonical-abstractions`, and
+`no-duplicate-symbols` are opt-in — declare your intent in the manifest and they
+enforce it.
+
+### 🛡️ Forcing Reusable Abstractions (Anti-Rebuilding The Wheel)
+
+When AI agents or fast-moving teams write code, they often re-implement
+capabilities (e.g. WebRTC, chat sockets, auth headers) in multiple feature
+folders instead of abstracting into a shared pattern.
+
+`canonical-abstractions` gates this behavior by confining low-level primitives
+and third-party libraries to their blessed canonical path:
+
+```json
+{
+  "id": "canonical-webrtc",
+  "type": "canonical-abstractions",
+  "enabled": true,
+  "severity": "error",
+  "canonical": "src/shared/rtc/**",
+  "restricted_imports": ["simple-peer", "peerjs", "aiortc"],
+  "restricted_primitives": ["RTCPeerConnection", "mediaDevices.getUserMedia", "RTCDataChannel"],
+  "allow": ["tests/**", "**/*.test.*"],
+  "message": "Direct WebRTC usage is restricted. Abstract logic into src/shared/rtc and reuse it."
+}
+```
+
+If an agent attempts to instantiate `RTCPeerConnection` or import `simple-peer`
+in `src/features/chat.ts`, `drift check` fails immediately at the gate:
+
+```text
+src/features/chat.ts:14: [canonical-webrtc] Direct WebRTC usage is restricted. Abstract logic into src/shared/rtc and reuse it.
+```
+
+Moreover, `drift map` automatically includes declared canonical abstractions so
+coding agents inspecting `.drift/map.json` know what reusable abstractions exist
+before writing any new code.
 
 ## 🧠 How it works
 

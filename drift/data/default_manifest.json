@@ -72,6 +72,48 @@
       "source_refs": [
         "drift-be-gone/entrypoints-exist"
       ]
+    },
+    {
+      "id": "canonical-abstractions",
+      "type": "canonical-abstractions",
+      "enabled": false,
+      "severity": "error",
+      "abstractions": [],
+      "description": "Capabilities must be abstracted into canonical patterns rather than rebuilt.",
+      "what": "Blocks direct usage of restricted libraries, primitives, and symbols outside declared canonical modules.",
+      "why": "Stops agents and developers from rebuilding the wheel instead of abstracting and reusing shared code.",
+      "source_refs": [
+        "drift-be-gone/canonical-abstractions"
+      ]
+    },
+    {
+      "id": "no-duplicate-symbols",
+      "type": "no-duplicate-symbols",
+      "enabled": false,
+      "severity": "warning",
+      "allow": [
+        "tests/**",
+        "**/*test*",
+        "**/*_test.py",
+        "**/*.test.*",
+        "**/__init__.py"
+      ],
+      "ignore": [
+        "main",
+        "setup",
+        "teardown",
+        "run",
+        "handler",
+        "render",
+        "default",
+        "init"
+      ],
+      "description": "Core functions and classes should be defined once and reused.",
+      "what": "Flags duplicate function and class names defined across multiple modules.",
+      "why": "Duplicate symbols across feature modules signal copy-pasting instead of abstraction.",
+      "source_refs": [
+        "drift-be-gone/no-duplicate-symbols"
+      ]
     }
   ]
 }

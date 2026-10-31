@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
 
-from .analyze import Graph, build_graph
+from .analyze import Graph, Module, build_graph
 
 RULE_TYPES = frozenset(
     {
@@ -15,6 +16,8 @@ RULE_TYPES = frozenset(
         "forbidden-deps",
         "orphan-modules",
         "entrypoints-exist",
+        "canonical-abstractions",
+        "no-duplicate-symbols",
     }
 )
 
@@ -28,8 +31,32 @@ class Violation:
     severity: str = "error"
 
 
-def _matches(path: str, patterns: list[str]) -> bool:
+def _matches(path: str, patterns: list[str] | str) -> bool:
+    if isinstance(patterns, str):
+        patterns = [patterns]
     return any(fnmatch(path, pattern) for pattern in patterns)
+
+
+def _normalize_patterns(val: str | list[str] | None) -> list[str]:
+    if not val:
+        return []
+    if isinstance(val, str):
+        return [val]
+    return list(val)
+
+
+def _find_line_number(path: Path, pattern: str, is_regex: bool = False) -> int | None:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return None
+    for idx, line in enumerate(lines, start=1):
+        if is_regex:
+            if re.search(pattern, line):
+                return idx
+        elif pattern in line:
+            return idx
+    return None
 
 
 def _find_cycles(graph: Graph) -> list[list[str]]:
@@ -132,12 +159,197 @@ def _entrypoints_exist(rule: dict, graph: Graph, root: Path) -> list[Violation]:
     return out
 
 
+def _check_restricted_imports(
+    rule_id: str,
+    rel: str,
+    module: Module,
+    file_path: Path,
+    item: dict,
+    canonical_display: str,
+) -> list[Violation]:
+    restricted_imports = item.get("restricted_imports", [])
+    custom_message = item.get("message")
+    out: list[Violation] = []
+    for imp in sorted(module.imports):
+        for restricted in restricted_imports:
+            if imp != restricted and not imp.startswith(f"{restricted}.") and not imp.startswith(f"{restricted}/"):
+                continue
+            line = _find_line_number(
+                file_path,
+                rf"""(?:from\s+|import\s+|require\(\s*['"]){re.escape(restricted)}""",
+                is_regex=True,
+            ) or _find_line_number(file_path, restricted)
+            msg = custom_message or (
+                f"direct import of '{restricted}' is restricted outside canonical path '{canonical_display}'. "
+                f"Abstract into a reusable pattern in '{canonical_display}' and reuse it."
+            )
+            out.append(Violation(rule_id=rule_id, path=rel, line=line, message=msg))
+            break
+    return out
+
+
+def _check_restricted_primitives(
+    rule_id: str,
+    rel: str,
+    file_path: Path,
+    item: dict,
+    canonical_display: str,
+) -> list[Violation]:
+    restricted_primitives = item.get("restricted_primitives", [])
+    custom_message = item.get("message")
+    if not restricted_primitives or not file_path.exists():
+        return []
+    try:
+        file_text = file_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return []
+
+    out: list[Violation] = []
+    for primitive in restricted_primitives:
+        if primitive not in file_text:
+            continue
+        pattern = (
+            rf"\b{re.escape(primitive)}\b"
+            if re.match(r"^\w+$", primitive)
+            else re.escape(primitive)
+        )
+        line = _find_line_number(file_path, pattern, is_regex=True)
+        if line is not None:
+            msg = custom_message or (
+                f"direct use of restricted primitive '{primitive}' is restricted outside "
+                f"canonical path '{canonical_display}'. "
+                f"Abstract into a reusable pattern in '{canonical_display}' and reuse it."
+            )
+            out.append(Violation(rule_id=rule_id, path=rel, line=line, message=msg))
+    return out
+
+
+def _check_restricted_symbols(
+    rule_id: str,
+    rel: str,
+    module: Module,
+    file_path: Path,
+    item: dict,
+    canonical_display: str,
+) -> list[Violation]:
+    restricted_symbols = item.get("restricted_symbols", [])
+    custom_message = item.get("message")
+    if not restricted_symbols:
+        return []
+    out: list[Violation] = []
+    declared = set(module.functions + module.classes)
+    for sym in restricted_symbols:
+        if sym not in declared:
+            continue
+        line = _find_line_number(
+            file_path,
+            rf"\b(def|class|function|const|let|var)\s+{re.escape(sym)}\b",
+            is_regex=True,
+        )
+        msg = custom_message or (
+            f"symbol '{sym}' must only be defined in canonical path '{canonical_display}'."
+        )
+        out.append(Violation(rule_id=rule_id, path=rel, line=line, message=msg))
+    return out
+
+
+def _scan_abstraction(
+    rule_id: str,
+    item: dict,
+    graph: Graph,
+    root: Path,
+) -> list[Violation]:
+    name = item.get("name") or item.get("id") or rule_id
+    canonical_patterns = _normalize_patterns(item.get("canonical", []))
+    canonical_display = ", ".join(canonical_patterns) if canonical_patterns else "(unspecified)"
+    allow_patterns = _normalize_patterns(
+        item.get("allow", ["tests/**", "**/*test*", "**/*_test.py", "**/*.test.*"])
+    )
+
+    out: list[Violation] = []
+    if item.get("require_canonical_exists", False):
+        if not any(_matches(p, canonical_patterns) for p in graph.modules):
+            out.append(
+                Violation(
+                    rule_id=rule_id,
+                    path=canonical_patterns[0] if canonical_patterns else ".",
+                    line=None,
+                    message=(
+                        f"canonical abstraction '{name}' declared for '{canonical_display}', "
+                        f"but no matching files exist on disk. Abstract the reusable pattern first."
+                    ),
+                )
+            )
+
+    for rel, module in graph.modules.items():
+        if _matches(rel, canonical_patterns) or _matches(rel, allow_patterns):
+            continue
+        file_path = root / rel
+        out.extend(_check_restricted_imports(rule_id, rel, module, file_path, item, canonical_display))
+        out.extend(_check_restricted_primitives(rule_id, rel, file_path, item, canonical_display))
+        out.extend(_check_restricted_symbols(rule_id, rel, module, file_path, item, canonical_display))
+    return out
+
+
+def _canonical_abstractions(rule: dict, graph: Graph, root: Path) -> list[Violation]:
+    rule_id = rule.get("id", "canonical-abstractions")
+    abstractions = rule.get("abstractions")
+    if not isinstance(abstractions, list):
+        abstractions = [rule] if "canonical" in rule else []
+
+    out: list[Violation] = []
+    for item in abstractions:
+        out.extend(_scan_abstraction(rule_id, item, graph, root))
+    return out
+
+
+def _no_duplicate_symbols(rule: dict, graph: Graph, root: Path) -> list[Violation]:
+    rule_id = rule.get("id", "no-duplicate-symbols")
+    default_allow = ["tests/**", "**/*test*", "**/*_test.py", "**/*.test.*", "**/__init__.py"]
+    allow = _normalize_patterns(rule.get("allow", default_allow))
+    ignore_symbols = set(
+        rule.get(
+            "ignore",
+            ["main", "setup", "teardown", "run", "handler", "render", "default", "init"],
+        )
+    )
+    min_length = rule.get("min_length", 4)
+
+    symbols: dict[str, list[str]] = {}
+    for rel, module in graph.modules.items():
+        if _matches(rel, allow):
+            continue
+        for sym in set(module.functions + module.classes):
+            if len(sym) >= min_length and sym not in ignore_symbols:
+                symbols.setdefault(sym, []).append(rel)
+
+    out: list[Violation] = []
+    for sym, paths in sorted(symbols.items()):
+        if len(paths) <= 1:
+            continue
+        paths_str = ", ".join(sorted(paths))
+        for path in sorted(paths):
+            line = _find_line_number(
+                root / path,
+                rf"\b(def|class|function|const|let|var)\s+{re.escape(sym)}\b",
+                is_regex=True,
+            )
+            msg = (
+                f"duplicate symbol '{sym}' defined in multiple modules: {paths_str}. "
+                f"Abstract into a shared module and reuse."
+            )
+            out.append(Violation(rule_id=rule_id, path=path, line=line, message=msg))
+    return out
+
+
 _RULES = {
     "no-cycles": _no_cycles,
     "layering": _layering,
     "forbidden-deps": _forbidden_deps,
     "orphan-modules": _orphan_modules,
     "entrypoints-exist": _entrypoints_exist,
+    "canonical-abstractions": _canonical_abstractions,
+    "no-duplicate-symbols": _no_duplicate_symbols,
 }
 
 
@@ -169,8 +381,14 @@ def validate_manifest(manifest: dict) -> list[str]:
         return ["manifest must define a non-empty 'rules' array"]
     for index, rule in enumerate(rules):
         label = rule.get("id", f"rule[{index}]")
-        if rule.get("type") not in RULE_TYPES:
-            problems.append(f"{label}: unknown rule type {rule.get('type')!r}")
+        rtype = rule.get("type")
+        if rtype not in RULE_TYPES:
+            problems.append(f"{label}: unknown rule type {rtype!r}")
         if rule.get("severity", "error") not in {"error", "warning"}:
             problems.append(f"{label}: severity must be error or warning")
+        if rtype == "canonical-abstractions":
+            if "abstractions" in rule and not isinstance(rule["abstractions"], list):
+                problems.append(f"{label}: 'abstractions' must be an array")
+            elif "abstractions" not in rule and "canonical" not in rule:
+                problems.append(f"{label}: must define 'canonical' or 'abstractions'")
     return problems

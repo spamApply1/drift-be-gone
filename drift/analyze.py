@@ -82,7 +82,7 @@ def _analyze_python(path: Path, rel: str, root: Path) -> Module:
 
 
 def _classify_python_node(node: ast.AST, tree: ast.AST, module: Module) -> None:
-    if isinstance(node, ast.FunctionDef) and _top_level(node, tree):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and _top_level(node, tree):
         module.functions.append(node.name)
     elif isinstance(node, ast.ClassDef) and _top_level(node, tree):
         module.classes.append(node.name)
@@ -102,6 +102,11 @@ def _analyze_js(path: Path, rel: str) -> Module:
     text = path.read_text(encoding="utf-8", errors="ignore")
     module.imports.update(_JS_IMPORT.findall(text))
     module.functions.extend(re.findall(r"function\s+([A-Za-z_$][\w$]*)", text))
+    _arrow_fn = (
+        r"(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*"
+        r"(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>"
+    )
+    module.functions.extend(re.findall(_arrow_fn, text))
     module.classes.extend(re.findall(r"class\s+([A-Za-z_$][\w$]*)", text))
     return module
 
