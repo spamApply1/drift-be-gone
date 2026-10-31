@@ -63,6 +63,7 @@ def _extract_abstractions(manifest: dict | None) -> list[dict]:
             "description": a.get("description", ""),
             "restricted_imports": a.get("restricted_imports", []),
             "restricted_primitives": a.get("restricted_primitives", []),
+            "restricted_symbols": a.get("restricted_symbols", []),
         }
         for a in items
     ]

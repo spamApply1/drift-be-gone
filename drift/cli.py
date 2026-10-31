@@ -19,6 +19,16 @@ def _load_manifest(path: str | None) -> dict:
     return json.loads(manifest_path.read_text(encoding="utf-8"))
 
 
+def _discover_manifest(repo_root: Path, manifest_arg: str | None) -> dict:
+    if manifest_arg:
+        return _load_manifest(manifest_arg)
+    for name in ("drift_manifest.json", ".drift/manifest.json", "drift.json", "architecture.json"):
+        candidate = repo_root / name
+        if candidate.is_file():
+            return _load_manifest(str(candidate))
+    return _load_manifest(None)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="drift", description="Architecture gate + repo map.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -37,8 +47,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _run_check(args: argparse.Namespace) -> int:
-    engine = RuleEngine(_load_manifest(args.manifest))
-    violations = engine.scan(Path(args.repo_root).expanduser(), strict=args.strict)
+    root = Path(args.repo_root).expanduser()
+    manifest = _discover_manifest(root, args.manifest)
+    engine = RuleEngine(manifest)
+    violations = engine.scan(root, strict=args.strict)
     if args.json:
         print(json.dumps([asdict(v) for v in violations], indent=2))
     elif not violations:
@@ -52,15 +64,7 @@ def _run_check(args: argparse.Namespace) -> int:
 
 def _run_map(args: argparse.Namespace) -> int:
     root = Path(args.repo_root).expanduser()
-    manifest = None
-    manifest_arg = getattr(args, "manifest", None)
-    if manifest_arg:
-        manifest = _load_manifest(manifest_arg)
-    elif _DEFAULT_MANIFEST.exists():
-        try:
-            manifest = _load_manifest(None)
-        except (OSError, json.JSONDecodeError):
-            manifest = None
+    manifest = _discover_manifest(root, args.manifest)
     artifact = build_map(root, build_graph(root), manifest=manifest)
     text = json.dumps(artifact, indent=2)
     if args.output:

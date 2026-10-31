@@ -200,6 +200,162 @@ class ArchitectureRuleTests(unittest.TestCase):
         self.assertTrue(all(v.line == 1 for v in violations))
         self.assertTrue(all("WebRTCChat" in v.message for v in violations))
 
+    def test_canonical_abstraction_blocks_js_dynamic_imports_and_reexports(self) -> None:
+        self._write("shared/rtc/webrtc.ts", "export const rtc = 1;\n")
+        self._write(
+            "features/chat.ts",
+            "// import 'simple-peer' in comment\n"
+            "export { Peer } from 'simple-peer';\n"
+            "async function load() {\n"
+            "  const p = await import('simple-peer');\n"
+            "}\n",
+        )
+        manifest = {
+            "rules": [
+                {
+                    "id": "canonical-webrtc",
+                    "type": "canonical-abstractions",
+                    "canonical": "shared/rtc/**",
+                    "restricted_imports": ["simple-peer"],
+                }
+            ]
+        }
+        violations = RuleEngine(manifest).scan(self.root, strict=True)
+        self.assertEqual(len(violations), 2)
+        lines = [v.line for v in violations]
+        self.assertEqual(lines, [2, 4])
+        self.assertEqual(violations[0].restriction, "simple-peer")
+        self.assertEqual(violations[0].canonical, "shared/rtc/**")
+
+    def test_canonical_abstraction_blocks_python_dynamic_imports(self) -> None:
+        self._write("shared/rtc/client.py", "x = 1\n")
+        self._write(
+            "features/call.py",
+            "import importlib\n"
+            "mod = importlib.import_module('aiortc')\n"
+            "mod2 = __import__('aiortc')\n",
+        )
+        manifest = {
+            "rules": [
+                {
+                    "id": "canonical-webrtc",
+                    "type": "canonical-abstractions",
+                    "canonical": "shared/rtc/**",
+                    "restricted_imports": ["aiortc"],
+                }
+            ]
+        }
+        violations = RuleEngine(manifest).scan(self.root, strict=True)
+        self.assertEqual(len(violations), 2)
+        lines = [v.line for v in violations]
+        self.assertEqual(lines, [2, 3])
+
+    def test_canonical_abstraction_ignores_primitives_in_comments_and_docstrings(self) -> None:
+        self._write("shared/rtc/webrtc.ts", "export const rtc = 1;\n")
+        self._write(
+            "features/py_safe.py",
+            "# RTCPeerConnection in comment\n"
+            "'''docstring with RTCPeerConnection'''\n"
+            "def run():\n"
+            "    pc = RTCPeerConnection()\n",
+        )
+        self._write(
+            "features/js_safe.ts",
+            "// RTCPeerConnection in comment\n"
+            "/* multi-line RTCPeerConnection */\n"
+            "const pc = new RTCPeerConnection();\n",
+        )
+        manifest = {
+            "rules": [
+                {
+                    "id": "canonical-webrtc",
+                    "type": "canonical-abstractions",
+                    "canonical": "shared/rtc/**",
+                    "restricted_primitives": ["RTCPeerConnection"],
+                }
+            ]
+        }
+        violations = RuleEngine(manifest).scan(self.root, strict=True)
+        self.assertEqual(len(violations), 2)
+        by_path = {v.path: v for v in violations}
+        self.assertEqual(by_path["features/py_safe.py"].line, 4)
+        self.assertEqual(by_path["features/js_safe.ts"].line, 3)
+
+    def test_canonical_abstraction_dotted_and_bracket_primitives(self) -> None:
+        self._write("shared/rtc/webrtc.ts", "export const rtc = 1;\n")
+        self._write(
+            "features/devices.ts",
+            "const a = navigator.mediaDevices.getUserMedia();\n"
+            "const b = window['RTCPeerConnection'];\n",
+        )
+        manifest = {
+            "rules": [
+                {
+                    "id": "canonical-webrtc",
+                    "type": "canonical-abstractions",
+                    "canonical": "shared/rtc/**",
+                    "restricted_primitives": ["navigator.mediaDevices.getUserMedia", "RTCPeerConnection"],
+                }
+            ]
+        }
+        violations = RuleEngine(manifest).scan(self.root, strict=True)
+        self.assertEqual(len(violations), 2)
+        lines = [v.line for v in violations]
+        self.assertEqual(lines, [1, 2])
+
+    def test_canonical_abstraction_inheritance(self) -> None:
+        self._write("shared/rtc/client.py", "x = 1\n")
+        self._write("tests/test_call.py", "import aiortc\n")
+        manifest = {
+            "rules": [
+                {
+                    "id": "canonical-suite",
+                    "type": "canonical-abstractions",
+                    "allow": ["tests/**"],
+                    "abstractions": [
+                        {
+                            "name": "webrtc",
+                            "canonical": "shared/rtc/**",
+                            "restricted_imports": ["aiortc"],
+                        }
+                    ],
+                }
+            ]
+        }
+        violations = RuleEngine(manifest).scan(self.root, strict=True)
+        self.assertEqual(violations, [])
+
+    def test_manifest_deep_validation(self) -> None:
+        self.assertTrue(validate_manifest(
+            {"rules": [{"id": "x", "type": "canonical-abstractions", "abstractions": [None]}]}
+        ))
+        self.assertTrue(validate_manifest(
+            {"rules": [{"id": "x", "type": "canonical-abstractions", "abstractions": [{}]}]}
+        ))
+        self.assertTrue(validate_manifest(
+            {"rules": [{"id": "x", "type": "canonical-abstractions", "canonical": 123}]}
+        ))
+
+    def test_cli_manifest_auto_discovery(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        (root / "shared" / "rtc").mkdir(parents=True)
+        (root / "shared" / "rtc" / "client.py").write_text("x = 1\n", encoding="utf-8")
+        (root / "features").mkdir(parents=True)
+        (root / "features" / "call.py").write_text("import aiortc\n", encoding="utf-8")
+        project_manifest = {
+            "rules": [
+                {
+                    "id": "canonical-webrtc",
+                    "type": "canonical-abstractions",
+                    "severity": "error",
+                    "canonical": "shared/rtc/**",
+                    "restricted_imports": ["aiortc"],
+                }
+            ]
+        }
+        (root / "drift_manifest.json").write_text(json.dumps(project_manifest), encoding="utf-8")
+        self.assertEqual(main(["check", str(root), "--json"]), 1)
+
     def test_no_duplicate_symbols_ignored_for_tests(self) -> None:
         self._write("tools/chat.py", "class WebRTCChat:\n    pass\n")
         self._write("tests/test_chat.py", "class WebRTCChat:\n    pass\n")

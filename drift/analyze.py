@@ -17,13 +17,41 @@ _SKIP_DIRS = frozenset(
 )
 _PY = (".py",)
 _JS = (".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx")
-_JS_IMPORT = re.compile(r"""(?:import[^'"]*from|import|require\()\s*['"]([^'"]+)['"]""")
+_JS_IMPORT_PATTERN = re.compile(
+    r"""(?:(?:import|export)\s+(?:(?:\*|[A-Za-z0-9_$,\s{}]+)\s+from\s+)?['"]([^'"]+)['"]|"""
+    r"""(?:require|import)\s*\(\s*['"]([^'"]+)['"]\))"""
+)
+_JS_FN_TOP = re.compile(
+    r"^(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)",
+    re.MULTILINE,
+)
+_JS_ARROW_TOP = re.compile(
+    r"^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>",
+    re.MULTILINE,
+)
+_JS_CLASS_TOP = re.compile(
+    r"^(?:export\s+(?:default\s+)?)?class\s+([A-Za-z_$][\w$]*)",
+    re.MULTILINE,
+)
+
+
+def _strip_js_comments(src: str) -> str:
+    pattern = r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|`(?:\\.|[^`\\])*`)|(/\*[\s\S]*?\*/|//[^\r\n]*)'
+
+    def replacer(m: re.Match) -> str:
+        if m.group(2):
+            s = m.group(2)
+            return "\n" * s.count("\n") + " " * (len(s) - s.count("\n"))
+        return m.group(1)
+
+    return re.sub(pattern, replacer, src)
 
 
 @dataclass
 class Module:
     path: str
     imports: set[str] = field(default_factory=set)
+    import_locations: list[tuple[str, int]] = field(default_factory=list)
     functions: list[str] = field(default_factory=list)
     classes: list[str] = field(default_factory=list)
 
@@ -84,13 +112,38 @@ def _analyze_python(path: Path, rel: str, root: Path) -> Module:
 def _classify_python_node(node: ast.AST, tree: ast.AST, module: Module) -> None:
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and _top_level(node, tree):
         module.functions.append(node.name)
-    elif isinstance(node, ast.ClassDef) and _top_level(node, tree):
+        return
+    if isinstance(node, ast.ClassDef) and _top_level(node, tree):
         module.classes.append(node.name)
-    elif isinstance(node, ast.Import):
-        module.imports.update(alias.name for alias in node.names)
-    elif isinstance(node, ast.ImportFrom) and node.module:
+        return
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            module.imports.add(alias.name)
+            module.import_locations.append((alias.name, node.lineno))
+        return
+    if isinstance(node, ast.ImportFrom) and node.module:
         module.imports.add(node.module)
+        module.import_locations.append((node.module, node.lineno))
         module.imports.update(f"{node.module}.{alias.name}" for alias in node.names)
+        return
+    if isinstance(node, ast.Call):
+        target = _call_import_target(node)
+        if target:
+            module.imports.add(target)
+            module.import_locations.append((target, node.lineno))
+
+
+def _call_import_target(node: ast.Call) -> str | None:
+    func = node.func
+    if isinstance(func, ast.Name) and func.id == "__import__" and node.args:
+        first = node.args[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            return first.value
+    elif isinstance(func, ast.Attribute) and func.attr == "import_module" and node.args:
+        first = node.args[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            return first.value
+    return None
 
 
 def _top_level(node: ast.AST, tree: ast.AST) -> bool:
@@ -100,14 +153,15 @@ def _top_level(node: ast.AST, tree: ast.AST) -> bool:
 def _analyze_js(path: Path, rel: str) -> Module:
     module = Module(path=rel)
     text = path.read_text(encoding="utf-8", errors="ignore")
-    module.imports.update(_JS_IMPORT.findall(text))
-    module.functions.extend(re.findall(r"function\s+([A-Za-z_$][\w$]*)", text))
-    _arrow_fn = (
-        r"(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*"
-        r"(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>"
-    )
-    module.functions.extend(re.findall(_arrow_fn, text))
-    module.classes.extend(re.findall(r"class\s+([A-Za-z_$][\w$]*)", text))
+    cleaned = _strip_js_comments(text)
+    for m in _JS_IMPORT_PATTERN.finditer(cleaned):
+        spec = m.group(1) or m.group(2)
+        line = cleaned[:m.start()].count("\n") + 1
+        module.imports.add(spec)
+        module.import_locations.append((spec, line))
+    module.functions.extend(_JS_FN_TOP.findall(cleaned))
+    module.functions.extend(_JS_ARROW_TOP.findall(cleaned))
+    module.classes.extend(_JS_CLASS_TOP.findall(cleaned))
     return module
 
 
