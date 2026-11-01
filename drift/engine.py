@@ -9,6 +9,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 from .analyze import Graph, JSToken, Module, build_graph, lex_js
+from . import resolve
 
 RULE_TYPES = frozenset(
     {
@@ -18,6 +19,7 @@ RULE_TYPES = frozenset(
         "orphan-modules",
         "entrypoints-exist",
         "canonical-abstractions",
+        "resolve-imports",
         "no-duplicate-symbols",
         "no-duplicate-implementations",
         "require-synthetic",
@@ -463,6 +465,61 @@ def _canonical_abstractions(rule: dict, graph: Graph, root: Path) -> list[Violat
     return out
 
 
+_JS_SUFFIXES = (".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx")
+
+
+def _resolve_imports(rule: dict, graph: Graph, root: Path) -> list[Violation]:
+    """Flag calls to symbols exported elsewhere in the repo but not imported here.
+
+    This catches the "used but never imported" class of bug (an agent calls a
+    helper that lives in a sibling module but omits the import line) which pure
+    dependency-graph analysis cannot see. The cross-module export requirement
+    keeps the signal tight: only symbols that demonstrably exist somewhere in
+    the repo — yet are unresolved in the calling module — are reported.
+    """
+    rule_id = rule.get("id", "resolve-imports")
+    default_allow = [
+        "tests/**", "**/*test*", "*test*", "**/*.test.*", "*.test.*",
+        "**/*.spec.*", "*.spec.*", "**/vendor/**", "node_modules/**", "**/node_modules/**",
+    ]
+    allow = _normalize_patterns(rule.get("allow", default_allow))
+    extra_globals = frozenset(rule.get("globals", []) or [])
+    custom_message = rule.get("message")
+
+    sources: dict[str, str] = {}
+    for rel in graph.modules:
+        if not rel.endswith(_JS_SUFFIXES):
+            continue
+        file_path = root / rel
+        try:
+            sources[rel] = file_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+
+    export_index = resolve.build_export_index(sources)
+
+    out: list[Violation] = []
+    for rel, text in sources.items():
+        if _matches(rel, allow):
+            continue
+        for name, line, source in resolve.unresolved_calls(text, rel, export_index, extra_globals):
+            msg = custom_message or (
+                f"'{name}' is called but never imported or defined in this module. "
+                f"It is exported by '{source}' — add the missing import."
+            )
+            out.append(
+                Violation(
+                    rule_id=rule_id,
+                    path=rel,
+                    line=line,
+                    message=msg,
+                    restriction=name,
+                    canonical=source,
+                )
+            )
+    return out
+
+
 def _no_duplicate_symbols(rule: dict, graph: Graph, root: Path) -> list[Violation]:
     rule_id = rule.get("id", "no-duplicate-symbols")
     default_allow = ["tests/**", "**/*test*", "**/*_test.py", "**/*.test.*", "**/__init__.py"]
@@ -623,6 +680,7 @@ _RULES = {
     "orphan-modules": _orphan_modules,
     "entrypoints-exist": _entrypoints_exist,
     "canonical-abstractions": _canonical_abstractions,
+    "resolve-imports": _resolve_imports,
     "no-duplicate-symbols": _no_duplicate_symbols,
     "no-duplicate-implementations": _no_duplicate_implementations,
     "require-synthetic": _require_synthetic,
@@ -871,6 +929,13 @@ def validate_manifest(manifest: dict) -> list[str]:
             problems.append(f"{label}: 'description' must be a string")
         if rtype == "canonical-abstractions":
             _validate_canonical_rule(rule, label, problems)
+        elif rtype == "resolve-imports":
+            if "allow" in rule:
+                _validate_str_or_str_list(rule["allow"], "allow", label, problems)
+            if "globals" in rule:
+                _validate_str_list(rule["globals"], "globals", label, problems)
+            if "message" in rule and not isinstance(rule["message"], str):
+                problems.append(f"{label}: 'message' must be a string")
         elif rtype == "no-duplicate-symbols":
             if "allow" in rule:
                 _validate_str_or_str_list(rule["allow"], "allow", label, problems)
