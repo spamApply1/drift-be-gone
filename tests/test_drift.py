@@ -566,5 +566,74 @@ class ManifestAndCliTests(unittest.TestCase):
         self.assertTrue(out.exists())
 
 
+class CapabilityParityTests(unittest.TestCase):
+    """The capability-parity rule: equivalent capability affordances must
+    degrade gracefully and share one safe implementation."""
+
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp())
+
+    def _write(self, rel: str, text: str) -> None:
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def _manifest(self) -> dict:
+        return {
+            "rules": [
+                {
+                    "id": "capability-parity",
+                    "type": "capability-parity",
+                    "severity": "error",
+                    "capabilities": [
+                        {
+                            "id": "voice",
+                            "capability": [r"isAudioRecordingSupported\s*\(", r"\bSpeechRecognition\b"],
+                            "intent": ["voice", r"\bmic\b", "[Rr]ecord"],
+                            "fallback": ["showVoiceTranscriptInput", "analyzeVoiceText", "voice-text"],
+                            "message": "voice affordance has no typed fallback",
+                        },
+                        {
+                            "id": "clipboard",
+                            "capability": [r"navigator\s*\.\s*clipboard\s*\.\s*writeText\s*\("],
+                            "forbid_direct": True,
+                            "exempt": ["lib/clipboard.js"],
+                            "message": "use the shared copyToClipboard() helper",
+                        },
+                    ],
+                }
+            ]
+        }
+
+    def test_voice_without_fallback_flagged(self) -> None:
+        self._write(
+            "voice.js",
+            "function openMic(){ if(!isAudioRecordingSupported()){ showToast('no mic'); return; }\n"
+            "  const b = el('button',{className:'voice-mic','aria-label':'Record'}); }\n",
+        )
+        violations = RuleEngine(self._manifest()).scan(self.root, strict=True)
+        self.assertTrue(any(v.rule_id == "capability-parity" and v.path == "voice.js" for v in violations))
+
+    def test_voice_with_text_fallback_passes(self) -> None:
+        self._write(
+            "voice.js",
+            "function openMic(){ if(!isAudioRecordingSupported()){ showVoiceTranscriptInput(); return; }\n"
+            "  const b = el('button',{className:'voice-mic','aria-label':'Record'});\n"
+            "  const t = el('input',{className:'voice-text'}); }\n",
+        )
+        violations = RuleEngine(self._manifest()).scan(self.root, strict=True)
+        self.assertFalse(any(v.restriction == "voice" for v in violations))
+
+    def test_direct_clipboard_write_flagged(self) -> None:
+        self._write("copy.js", "function copy(x){ navigator.clipboard.writeText(x); }\n")
+        violations = RuleEngine(self._manifest()).scan(self.root, strict=True)
+        self.assertTrue(any(v.rule_id == "capability-parity" and v.path == "copy.js" for v in violations))
+
+    def test_exempt_clipboard_helper_passes(self) -> None:
+        self._write("lib/clipboard.js", "export function copyToClipboard(x){ navigator.clipboard.writeText(x); }\n")
+        violations = RuleEngine(self._manifest()).scan(self.root, strict=True)
+        self.assertFalse(any(v.restriction == "clipboard" for v in violations))
+
+
 if __name__ == "__main__":
     unittest.main()
