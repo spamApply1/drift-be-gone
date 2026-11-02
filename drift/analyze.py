@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 from bisect import bisect_right
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 
 _SKIP_DIRS = frozenset(
@@ -652,7 +653,7 @@ def _js_target(source_rel: str, spec: str, known: set[str]) -> str | None:
     if not spec.startswith("."):
         return None
     base = Path(source_rel).parent
-    resolved = (base / spec).as_posix()
+    resolved = os.path.normpath((base / spec).as_posix())
     for suffix in ("", ".js", ".mjs", ".ts", ".tsx", ".jsx", "/index.js", "/index.ts"):
         candidate = f"{resolved}{suffix}"
         if candidate in known:

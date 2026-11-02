@@ -6,6 +6,7 @@ from .js, .mjs, .cjs, .ts, .tsx, .jsx files.
 
 from __future__ import annotations
 
+import os
 import re
 from bisect import bisect_left
 from pathlib import Path
@@ -153,7 +154,7 @@ class JSTSExtractor:
         if not spec.startswith("."):
             return None
         base = Path(source_rel).parent
-        resolved = (base / spec).as_posix()
+        resolved = os.path.normpath((base / spec).as_posix())
         for suffix in ("", ".ts", ".tsx", ".js", ".jsx", ".mjs", "/index.ts", "/index.js"):
             candidate = f"{resolved}{suffix}"
             if candidate in self.known_files:

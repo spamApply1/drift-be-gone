@@ -59,6 +59,7 @@ No architecture violations found.
 | `orphan-modules` | modules nothing imports (dead code / missing wiring) |
 | `entrypoints-exist` | declared entrypoints that are missing on disk |
 | `canonical-abstractions` | direct use of restricted libraries, primitives, or symbols outside declared canonical modules (forces reuse/abstraction) |
+| `resolve-imports` | a symbol *called* in a module that is neither imported nor declared there, yet is exported by another module in the repo (catches "used but never imported" ReferenceErrors) |
 | `no-duplicate-symbols` | duplicate top-level class or function names across distinct modules (catches copy-pasting and wheel rebuilding) |
 | `no-duplicate-implementations` | similar normalized function shapes across modules, even when names differ (review candidates, not proof of equivalent behavior) |
 | `require-synthetic` | non-exempt code files lacking a companion `.synthetic` file defining user workflows |
@@ -111,6 +112,41 @@ src/features/chat.ts:14: [canonical-webrtc] Direct WebRTC usage is restricted. A
 Moreover, `drift map` automatically includes declared canonical abstractions so
 coding agents inspecting `.drift/map.json` know what reusable abstractions exist
 before writing any new code.
+
+### 🔗 Resolving Missing Imports (`resolve-imports`)
+
+Fast code generation produces a specific, nasty bug: a module *calls* a helper
+that lives in a sibling module but the `import` line never gets written. The
+dependency graph still looks fine — there is simply no edge where one should be
+— so pure import-graph analysis stays silent while the code throws
+`ReferenceError: hasUserMedia is not defined` the moment that path runs.
+
+`resolve-imports` closes that gap. For every JS/TS module it collects the
+symbols that are *called* (`foo(...)`, `new Foo(...)`) and checks each one
+resolves to either a local declaration (import, function, class, `const`/`let`/
+`var`, or parameter) or a known runtime global. A call that resolves to none of
+those — **but is exported by another module in the repo** — is reported:
+
+```json
+{
+  "id": "resolve-imports",
+  "type": "resolve-imports",
+  "enabled": true,
+  "severity": "error",
+  "allow": ["tests/**", "**/*.test.*", "**/vendor/**"],
+  "globals": ["gtag", "dataLayer"]
+}
+```
+
+```text
+public/js/templates/shared.js:1462: [resolve-imports] 'hasUserMedia' is called but never imported or defined in this module. It is exported by 'public/js/camera-capture.js' — add the missing import.
+```
+
+The cross-module export requirement keeps the signal tight: the symbol provably
+exists somewhere in the codebase, yet is unresolved where it is used, so the
+report is almost always a genuinely missing import rather than a typo or an
+intentional global. Add extra ambient globals (analytics shims, injected SDKs)
+via `globals`, and exclude files with `allow`.
 
 ### 🎭 Behavioral & User-Journey Governance (`.synthetic` Companion Files)
 

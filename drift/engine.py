@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import io
+import re
 import tokenize
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
 
 from .analyze import Graph, JSToken, Module, build_graph, lex_js
+from . import resolve
 
 RULE_TYPES = frozenset(
     {
@@ -18,11 +20,13 @@ RULE_TYPES = frozenset(
         "orphan-modules",
         "entrypoints-exist",
         "canonical-abstractions",
+        "resolve-imports",
         "no-duplicate-symbols",
         "no-duplicate-implementations",
         "require-synthetic",
         "no-duplicate-workflows",
         "verify-synthetic-alignment",
+        "capability-parity",
     }
 )
 
@@ -463,6 +467,61 @@ def _canonical_abstractions(rule: dict, graph: Graph, root: Path) -> list[Violat
     return out
 
 
+_JS_SUFFIXES = (".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx")
+
+
+def _resolve_imports(rule: dict, graph: Graph, root: Path) -> list[Violation]:
+    """Flag calls to symbols exported elsewhere in the repo but not imported here.
+
+    This catches the "used but never imported" class of bug (an agent calls a
+    helper that lives in a sibling module but omits the import line) which pure
+    dependency-graph analysis cannot see. The cross-module export requirement
+    keeps the signal tight: only symbols that demonstrably exist somewhere in
+    the repo — yet are unresolved in the calling module — are reported.
+    """
+    rule_id = rule.get("id", "resolve-imports")
+    default_allow = [
+        "tests/**", "**/*test*", "*test*", "**/*.test.*", "*.test.*",
+        "**/*.spec.*", "*.spec.*", "**/vendor/**", "node_modules/**", "**/node_modules/**",
+    ]
+    allow = _normalize_patterns(rule.get("allow", default_allow))
+    extra_globals = frozenset(rule.get("globals", []) or [])
+    custom_message = rule.get("message")
+
+    sources: dict[str, str] = {}
+    for rel in graph.modules:
+        if not rel.endswith(_JS_SUFFIXES):
+            continue
+        file_path = root / rel
+        try:
+            sources[rel] = file_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+
+    export_index = resolve.build_export_index(sources)
+
+    out: list[Violation] = []
+    for rel, text in sources.items():
+        if _matches(rel, allow):
+            continue
+        for name, line, source in resolve.unresolved_calls(text, rel, export_index, extra_globals):
+            msg = custom_message or (
+                f"'{name}' is called but never imported or defined in this module. "
+                f"It is exported by '{source}' — add the missing import."
+            )
+            out.append(
+                Violation(
+                    rule_id=rule_id,
+                    path=rel,
+                    line=line,
+                    message=msg,
+                    restriction=name,
+                    canonical=source,
+                )
+            )
+    return out
+
+
 def _no_duplicate_symbols(rule: dict, graph: Graph, root: Path) -> list[Violation]:
     rule_id = rule.get("id", "no-duplicate-symbols")
     default_allow = ["tests/**", "**/*test*", "**/*_test.py", "**/*.test.*", "**/__init__.py"]
@@ -616,6 +675,104 @@ def _verify_synthetic_alignment(rule: dict, graph: Graph, root: Path) -> list[Vi
     ]
 
 
+# Default file suffixes scanned by the capability-parity rule.
+_CAP_SUFFIXES = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
+
+
+def _capability_parity(rule: dict, graph: Graph, root: Path) -> list[Violation]:
+    """Enforce graceful degradation of browser-capability affordances.
+
+    Catches the class of drift where the *same* user-facing capability (voice
+    input, clipboard copy, camera, etc.) is implemented inconsistently across
+    modules — one surface degrades gracefully while another dead-ends when the
+    capability is unavailable (insecure context, denied permission, unsupported
+    browser). Equivalent behaviour, divergent (and sometimes broken)
+    implementation — exactly the drift static style/lint gates miss.
+
+    Manifest shape::
+
+        {
+          "type": "capability-parity",
+          "id": "capability-parity",
+          "severity": "error",
+          "capabilities": [
+            {
+              "id": "voice",
+              "capability": ["isAudioRecordingSupported\\\\(", "SpeechRecognition"],
+              "intent": ["voice", "mic", "record"],
+              "fallback": ["type:\\\\s*['\\"]text['\\"]", "analyzeVoiceText"],
+              "message": "voice affordance must offer a typed fallback"
+            },
+            {
+              "id": "clipboard",
+              "capability": ["navigator\\\\.clipboard\\\\.writeText\\\\("],
+              "forbid_direct": true,
+              "message": "use the shared copyToClipboard() helper (execCommand fallback)"
+            }
+          ]
+        }
+
+    Per capability group:
+      * ``forbid_direct`` true  -> any ``capability`` match is a violation (the
+        affordance must route through a safe shared helper).
+      * otherwise (require-fallback) -> a ``capability`` match, with an optional
+        ``intent`` match, and NO ``fallback`` match is a violation.
+    Group-level and rule-level ``exempt``/``allow`` globs skip files.
+    """
+    rule_id = rule.get("id", "capability-parity")
+    default_exempt = _normalize_patterns(
+        rule.get("allow") or rule.get("exempt")
+        or ["tests/**", "**/__init__.py", "drift/**", "**/vendor/**", "node_modules/**"]
+    )
+    groups = rule.get("capabilities", []) or []
+    suffixes = tuple(rule.get("suffixes", _CAP_SUFFIXES))
+
+    # Pre-read the JS-ish sources once.
+    sources: dict[str, str] = {}
+    for rel in graph.modules:
+        if not rel.endswith(suffixes):
+            continue
+        try:
+            sources[rel] = (root / rel).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+
+    out: list[Violation] = []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        gid = group.get("id", "capability")
+        cap_res = [re.compile(p) for p in _normalize_patterns(group.get("capability"))]
+        if not cap_res:
+            continue
+        intent_res = [re.compile(p) for p in _normalize_patterns(group.get("intent"))]
+        fallback_res = [re.compile(p) for p in _normalize_patterns(group.get("fallback"))]
+        forbid_direct = bool(group.get("forbid_direct", False))
+        g_exempt = default_exempt + _normalize_patterns(group.get("exempt") or group.get("allow"))
+        message = group.get("message") or (
+            f"{gid}: direct capability use without a safe shared helper"
+            if forbid_direct else
+            f"{gid}: capability affordance has no graceful fallback (dead-ends when unavailable)"
+        )
+        severity = group.get("severity", rule.get("severity", "error"))
+
+        for rel, src in sources.items():
+            if _matches(rel, g_exempt):
+                continue
+            if not any(r.search(src) for r in cap_res):
+                continue
+            if forbid_direct:
+                out.append(Violation(rule_id, rel, None, message, severity, gid))
+                continue
+            # require-fallback: only files that actually render this affordance
+            if intent_res and not any(r.search(src) for r in intent_res):
+                continue
+            if fallback_res and any(r.search(src) for r in fallback_res):
+                continue
+            out.append(Violation(rule_id, rel, None, message, severity, gid))
+    return out
+
+
 _RULES = {
     "no-cycles": _no_cycles,
     "layering": _layering,
@@ -623,11 +780,13 @@ _RULES = {
     "orphan-modules": _orphan_modules,
     "entrypoints-exist": _entrypoints_exist,
     "canonical-abstractions": _canonical_abstractions,
+    "resolve-imports": _resolve_imports,
     "no-duplicate-symbols": _no_duplicate_symbols,
     "no-duplicate-implementations": _no_duplicate_implementations,
     "require-synthetic": _require_synthetic,
     "no-duplicate-workflows": _no_duplicate_workflows,
     "verify-synthetic-alignment": _verify_synthetic_alignment,
+    "capability-parity": _capability_parity,
 }
 
 
@@ -871,6 +1030,13 @@ def validate_manifest(manifest: dict) -> list[str]:
             problems.append(f"{label}: 'description' must be a string")
         if rtype == "canonical-abstractions":
             _validate_canonical_rule(rule, label, problems)
+        elif rtype == "resolve-imports":
+            if "allow" in rule:
+                _validate_str_or_str_list(rule["allow"], "allow", label, problems)
+            if "globals" in rule:
+                _validate_str_list(rule["globals"], "globals", label, problems)
+            if "message" in rule and not isinstance(rule["message"], str):
+                problems.append(f"{label}: 'message' must be a string")
         elif rtype == "no-duplicate-symbols":
             if "allow" in rule:
                 _validate_str_or_str_list(rule["allow"], "allow", label, problems)
